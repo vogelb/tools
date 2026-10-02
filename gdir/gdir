@@ -1,0 +1,906 @@
+#!/usr/bin/env bash
+# gdir - lists a directory like DIR, with every entry colored by its git state.
+#
+# Bash port of gdir.ps1. Shows the entries of a directory (default: the current one), or the
+# files and directories named, with date, size and name, and colors each entry by its state in
+# git: current, changed, staged, unmanaged (untracked), deleted, conflict or ignored. A deleted
+# file no longer exists on disk, so it is listed from git. A directory takes the most severe
+# state of its contents. Outside a git work tree the listing is plain.
+#
+# Needs bash 4.4 or newer, git, and GNU find and sort (Git Bash, Linux, WSL).
+# Run "gdir --help" for the usage page and "gdir --legend" for the color key.
+# Keep the line endings of this file LF: bash does not run a script with CRLF.
+#
+# This file was created with the help of AI — model: Claude Sonnet 5.5 (model ID: claude-sonnet-5.5)
+
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    echo 'gdir: bash 4.4 or newer is required' >&2
+    exit 2
+fi
+
+# =============================================================================================
+# Configuration: colors of the git states
+# =============================================================================================
+# Named colors: ANSI escape codes (SGR, Select Graphic Rendition) for the text color. The
+# terminal theme decides the exact shade. Add more the same way, for example CYAN=36.
+BLUE=34
+RED=31
+YELLOW=33
+GREEN=32
+LIGHTBLUE=94
+LIGHTRED=91
+LIGHTGREEN=92
+GRAY=90
+LIGHTGRAY=37
+WHITE=97
+PURPLE=35
+
+# The color of every state: change the named color on the right. After the color a state can
+# take  bold  and  strike  (strikethrough) and  on COLOR  (a background), for example
+#   [conflict]="$WHITE bold on $RED"
+declare -A STATE_COLORS=(
+    [current]=$GREEN
+    [changed]=$YELLOW
+    [staged]=$LIGHTBLUE
+    [unmanaged]=$WHITE
+    [deleted]="$RED strike"
+    [conflict]="$WHITE bold on $RED"
+    [ignored]=$GRAY
+)
+# =============================================================================================
+
+# Git state of an entry. The number is its severity: a directory takes the most severe state
+# found below it.
+IGNORED=0 CURRENT=1 UNMANAGED=2 STAGED=3 CHANGED=4 DELETED=5 CONFLICT=6
+NOSTATE=7        # index of the "no git information" entry in the PAINT arrays
+STATE_LABEL=(ignored current unmanaged staged changed deleted conflict)
+STATE_TAG=('!' ' ' '?' '+' 'M' 'D' 'U')
+STATE_TEXT=(
+    'matches .gitignore'
+    'tracked, unchanged'
+    'untracked: git does not manage it'
+    'changes staged in the index, nothing newer in the working tree'
+    'modified in the working tree'
+    'tracked but gone from the working tree (listed from git)'
+    'unmerged paths'
+)
+CURRENT_BIT=$(( 1 << CURRENT ))
+CHANGED_BIT=$(( 1 << CHANGED ))
+DELETED_BIT=$(( 1 << DELETED ))
+
+FS=$'\001'                  # separates the fields of a record
+export LC_COLLATE=C         # ordinal string comparison and sorting, like DIR
+
+# Windows file systems ignore case, so git and the disk may spell a name differently there.
+FOLD=0
+case $OSTYPE in msys* | cygwin* | darwin*) FOLD=1 ;; esac
+
+die() { printf 'gdir: %s\n' "$1" >&2; exit "${2:-2}"; }
+
+read -r -d '' USAGE <<'EOF'
+gdir - lists a directory like DIR, with every entry colored by its git state
+
+Usage:
+  gdir [options] [path...]
+  gdir --install [folder]
+  gdir --help
+
+Arguments:
+  path...       Files and directories to show. Default: the current directory.
+                A directory is listed, a file shows just its own entry (also a
+                dot file, and a file that git has deleted, even when its
+                directory is gone too). With several paths, each directory and
+                the files of each directory come below a "Directory of" line.
+                A path must exist, otherwise the exit code is 2; the other
+                paths are still shown. The shell expands wildcards.
+  -r, --recurse Also list the subdirectories, each below a "Directory of" line,
+                like DIR /S. A subdirectory that is its own git repository is
+                colored by that repository. Listed but not entered: .git and
+                symbolic links.
+  -w, --wide    Names only, in columns like DIR /W; directories in [brackets].
+                One name per line when the output is not a terminal.
+  -a, --all     Also list entries whose names start with a dot, such as .git.
+                Without it they are left out, like ls does.
+  --color=when  auto (default): color only on a terminal and only if the
+                NO_COLOR environment variable is not set.
+                always: color even when the output is redirected.
+                never: plain text.
+                A bare --color means --color=always.
+  --legend      Print the color key and exit.
+  --install     Copy gdir to a folder and add the folder to the PATH, unless
+                it is already on the PATH. The folder is the path argument,
+                default /c/tools in Git Bash, else ~/.local/bin; it is created
+                if needed. The PATH is extended by a line in ~/.bashrc, which
+                new shells read.
+  -h, --help    Print this page and exit.
+
+Short options can be combined (-ra). The colors of the git states are set in
+the configuration block at the top of gdir; gdir --legend shows the ones
+in use.
+
+Examples:
+  gdir                   list the current directory
+  gdir -w ../other       names only, another directory
+  gdir -r                the whole tree below the current directory
+  gdir a.txt ../b/c.txt  show just these files, with their git state
+  git diff -z --name-only --relative | xargs -0 -r gdir
+                         the files git reports as changed
+  gdir --install         copy gdir to the default folder
+
+Exit codes: 0 listing printed (a plain one, with a note on stderr, outside a
+git work tree) or installation done; 2 a path cannot be shown (does not exist,
+or cannot be read), or an option is invalid.
+EOF
+
+# --- options ---------------------------------------------------------------------------------
+
+WIDE=0 ALL=0 RECURSE=0 COLOR=auto LEGEND=0 INSTALL=0
+PATHS=()
+args=("$@")
+for arg in "${args[@]}"; do      # --help anywhere shows the usage page, whatever else is wrong
+    case $arg in
+        --) break ;;
+        -h | --help) printf '%s\n' "$USAGE"; exit 0 ;;
+    esac
+done
+i=0
+while (( i < ${#args[@]} )); do
+    arg=${args[i]}
+    i=$(( i + 1 ))
+    case $arg in
+        --) PATHS+=("${args[@]:i}"); break ;;
+        --wide) WIDE=1 ;;
+        --all) ALL=1 ;;
+        --recurse) RECURSE=1 ;;
+        --legend) LEGEND=1 ;;
+        --install) INSTALL=1 ;;
+        --color=*) COLOR=${arg#--color=} ;;
+        --color) COLOR=always ;;
+        --*) die "unknown option '$arg'; try: gdir --help" ;;
+        -?*)
+            for (( j = 1; j < ${#arg}; j++ )); do
+                case ${arg:j:1} in
+                    h) printf '%s\n' "$USAGE"; exit 0 ;;
+                    w) WIDE=1 ;;
+                    a) ALL=1 ;;
+                    r) RECURSE=1 ;;
+                    *) die "unknown option '-${arg:j:1}'; try: gdir --help" ;;
+                esac
+            done ;;
+        *) PATHS+=("$arg") ;;
+    esac
+done
+case $COLOR in
+    auto | always | never) ;;
+    *) die "invalid --color value '$COLOR': use auto, always or never" ;;
+esac
+
+# --- paths -----------------------------------------------------------------------------------
+
+# REPLY: the absolute form of the path $1, without ".", ".." and a trailing "/". Links are not
+# resolved, and the path does not have to exist.
+absolute_path() {
+    local - p=$1 IFS=/ part drive
+    local -a parts=()
+    set -f
+    if [[ $OSTYPE == msys* || $OSTYPE == cygwin* ]] && [[ $p =~ ^[A-Za-z]: ]]; then
+        p=${p//\\//}                 # C:\dir or C:/dir as Windows writes it: /c/dir
+        drive=${p:0:1}
+        p=/${drive,,}${p:2}
+    fi
+    [[ $p == /* ]] || p=$PWD/$p
+    for part in $p; do
+        case $part in
+            '' | .) ;;
+            ..) (( ${#parts[@]} )) && unset 'parts[${#parts[@]}-1]' ;;
+            *) parts+=("$part") ;;
+        esac
+    done
+    REPLY=/${parts[*]}
+}
+
+# --- install ---------------------------------------------------------------------------------
+
+# Succeeds when the folder $1 is one of the entries of the PATH.
+on_path() {
+    local wanted=${1%/} entry
+    local -a entries
+    (( FOLD )) && wanted=${wanted,,}
+    IFS=: read -ra entries <<<"$PATH"
+    for entry in "${entries[@]}"; do
+        entry=${entry%/}
+        (( FOLD )) && entry=${entry,,}
+        [[ -n $entry && $entry == "$wanted" ]] && return 0
+    done
+    return 1
+}
+
+# Copies this script to $1 (created if needed) and puts that folder on the PATH of new shells.
+install_gdir() {
+    local target=${1-} folder src dest quoted line rcfile found entry
+    if [[ -z $target ]]; then
+        if [[ $OSTYPE == msys* || $OSTYPE == cygwin* ]]; then target=/c/tools; else target=$HOME/.local/bin; fi
+    fi
+    absolute_path "$target"
+    folder=$REPLY
+    [[ $folder == *:* ]] && die "the install folder must not contain ':', it separates the PATH entries"
+    [[ -f $folder ]] && die "'$folder' is a file, not a folder"
+    absolute_path "${BASH_SOURCE[0]}"
+    src=$REPLY
+    [[ -f $src ]] || die 'cannot install: this script file is not available'
+    if [[ ! -d $folder ]]; then
+        mkdir -p -- "$folder" || die "cannot create '$folder'" 1
+        echo "created folder: $folder"
+    fi
+    dest=$folder/gdir
+    [[ -d $dest ]] && die "'$dest' is a folder, not a file"
+    if [[ -f $dest && "$(< "$src")" == "$(< "$dest")" ]]; then
+        echo "up to date: $dest"
+    else
+        cp -- "$src" "$dest" || die "cannot copy to '$dest'" 1
+        chmod +x -- "$dest"
+        echo "copied: $dest"
+    fi
+    if on_path "$folder"; then
+        echo "already on the PATH: $folder"
+    else
+        printf -v quoted '%q' "$folder"
+        line='export PATH="$PATH":'$quoted
+        rcfile=$HOME/.bashrc
+        found=0
+        if [[ -f $rcfile ]]; then
+            while IFS= read -r entry || [[ -n $entry ]]; do
+                [[ $entry == "$line" ]] && found=1
+            done < "$rcfile"
+        fi
+        if (( found )); then
+            echo "already in $rcfile: $line"
+        else
+            printf '\n# added by gdir --install\n%s\n' "$line" >> "$rcfile" || die "cannot write '$rcfile'" 1
+            echo "added to $rcfile: $line"
+        fi
+    fi
+    echo 'Done. New shells can run: gdir --help'
+}
+
+if (( INSTALL )); then
+    (( ${#PATHS[@]} > 1 )) && die "--install takes one folder, not ${#PATHS[@]}"
+    install_gdir "${PATHS[0]-}"
+    exit 0
+fi
+
+# --- colors ----------------------------------------------------------------------------------
+
+# REPLY: the SGR parameters for the color setting $2 of the state $1 (see the configuration block).
+style_codes() {
+    local - state=$1 spec=$2 tok fg='' bg='' bold=0 strike=0 want_bg=0 codes
+    set -f
+    for tok in $spec; do
+        if (( want_bg )); then
+            [[ $tok =~ ^[0-9]+$ ]] || die "the configuration block has an invalid background color '$tok' for the state '$state'"
+            bg=$(( tok + 10 ))
+            want_bg=0
+            continue
+        fi
+        case $tok in
+            bold) bold=1 ;;
+            strike) strike=1 ;;
+            on) want_bg=1 ;;
+            *[!0-9]* | '') die "the configuration block has an invalid color '$tok' for the state '$state'; use a named color such as \$GREEN" ;;
+            *) [[ -z $fg ]] || die "the configuration block has two text colors for the state '$state'"; fg=$tok ;;
+        esac
+    done
+    (( want_bg )) && die "the configuration block has 'on' without a color for the state '$state'"
+    [[ -n $fg ]] || die "the configuration block has no color for the state '$state'"
+    codes=$fg
+    (( bold )) && codes=1\;$codes
+    (( strike )) && codes+=\;9
+    [[ -n $bg ]] && codes+=\;$bg
+    REPLY=$codes
+}
+
+use_color=0
+case $COLOR in
+    always) use_color=1 ;;
+    auto) [[ -t 1 && -z ${NO_COLOR-} && ${TERM-} != dumb ]] && use_color=1 ;;
+esac
+
+# The escape sequences that start and end the colored text of each state; index NOSTATE is for
+# entries without git information. Empty without color.
+PAINT_ON=('' '' '' '' '' '' '' '')
+PAINT_OFF=('' '' '' '' '' '' '' '')
+for (( s = IGNORED; s <= CONFLICT; s++ )); do
+    [[ -n ${STATE_COLORS[${STATE_LABEL[s]}]+x} ]] || die "the configuration block has no color for the state '${STATE_LABEL[s]}'"
+    style_codes "${STATE_LABEL[s]}" "${STATE_COLORS[${STATE_LABEL[s]}]}"
+    if (( use_color )); then
+        PAINT_ON[s]=$'\e'"[${REPLY}m"
+        PAINT_OFF[s]=$'\e[0m'
+    fi
+done
+
+if (( LEGEND )); then
+    for s in $CURRENT $CHANGED $STAGED $UNMANAGED $DELETED $CONFLICT $IGNORED; do
+        printf -v label '%-9s' "${STATE_LABEL[s]}"
+        printf '%s %s%s%s %s\n' "${STATE_TAG[s]}" "${PAINT_ON[s]}" "$label" "${PAINT_OFF[s]}" "${STATE_TEXT[s]}"
+    done
+    printf '\n'
+    printf '%s\n' 'The first column is the tag shown by the default listing.' \
+        'A directory shows the most severe state inside it: conflict > changed > staged > unmanaged > current > ignored.' \
+        'A deleted file inside a directory makes the directory changed.'
+    exit 0
+fi
+
+# --- git -------------------------------------------------------------------------------------
+
+GIT=$(command -v git)
+declare -A NOTED=()
+# Says something once on stderr, however often it is called with the same message.
+note() {
+    [[ -n ${NOTED[$1]+x} ]] && return
+    NOTED[$1]=1
+    printf '%s\n' "$1" >&2
+}
+
+# Maps the XY pair of "git status --porcelain=v1" to a state, in REPLY.
+state_of() {
+    local x=$1 y=$2
+    if [[ $x == '?' ]]; then REPLY=$UNMANAGED
+    elif [[ $x == '!' ]]; then REPLY=$IGNORED
+    elif [[ $x == U || $y == U || $x$y == AA || $x$y == DD ]]; then REPLY=$CONFLICT
+    elif [[ $x == D || $y == D ]]; then REPLY=$DELETED
+    elif [[ $y != ' ' ]]; then REPLY=$CHANGED
+    else REPLY=$STAGED
+    fi
+}
+
+# What git knows is kept in these arrays, with keys "<id>|<path>": one id for every call of
+# read_git_state, the path relative to the directory it was called for, in lower case where
+# the file system ignores case.
+#   MASK       bit mask (1 << state) of the states reported at or below a path
+#   TRACKED    paths in the index, and directories that contain such paths
+#   COLLAPSED  directory -> state, for untracked or ignored directories that git reports whole
+#   GHOSTS     "<id>|<directory>" -> the names of the deleted entries directly below it
+#   GHOSTNAME / GHOSTDIR   "<id>|<directory>|<name>" -> the name as git spells it / 1 if a directory
+#   BASE       id -> state of the directory itself when it lies inside an untracked or ignored
+#              directory, else -1
+declare -A MASK=() TRACKED=() COLLAPSED=() GHOSTS=() GHOSTNAME=() GHOSTDIR=() BASE=()
+GIT_SERIAL=0
+GID=
+
+# Reads what git knows about the entries below the directory $1 ($2 is 1 for the whole tree
+# below it, else just the entries directly in it). Succeeds with the id in GID, or fails after
+# saying why on stderr (once for every distinct message), when there is no git information.
+read_git_state() {
+    local dir=$1 deep=$2 id prefix prefix_l p_l sfd ffd rec x y p rel st isdirrec bit rest acc comp parent last
+    local k mk gk nk nkname key f d top msg code n
+    local -a statrecs=() filerecs=()
+    local -A pstate=()
+    local base=-1
+    if [[ -z $GIT ]]; then
+        note 'gdir: git not found on PATH; showing a plain listing'
+        return 1
+    fi
+    id=$(( ++GIT_SERIAL ))
+    # The three queries run at the same time, inside $dir (cd, not git -C): in Git Bash git is a native
+    # Windows program, and the conversion of a path argument fails for names with [ or $.
+    exec {sfd}< <(cd "$dir" 2>/dev/null && git --no-optional-locks status --porcelain=v1 -z --no-renames --ignored=matching --untracked-files=normal -- . 2>/dev/null; printf 'GDIR-EXIT\0%s\0' "$?")
+    exec {ffd}< <(cd "$dir" 2>/dev/null && git ls-files -z -- . 2>/dev/null; printf 'GDIR-EXIT\0%s\0' "$?")
+    if ! prefix=$(cd "$dir" 2>/dev/null && git rev-parse --show-prefix 2>/dev/null); then
+        exec {sfd}<&- {ffd}<&-
+        msg=$(cd "$dir" 2>&1 && git rev-parse --show-prefix 2>&1 >/dev/null)
+        note "gdir: ${msg%%$'\n'*}; showing a plain listing"
+        return 1
+    fi
+    mapfile -d '' -t statrecs <&"$sfd"
+    exec {sfd}<&-
+    mapfile -d '' -t filerecs <&"$ffd"
+    exec {ffd}<&-
+    for rec in statrecs filerecs; do
+        local -n records=$rec
+        if (( ${#records[@]} < 2 )) || [[ ${records[-2]} != GDIR-EXIT ]]; then
+            note "gdir: git ended unexpectedly; showing a plain listing"
+            return 1
+        fi
+        n=${#records[@]}
+        code=${records[n - 1]}
+        # One unset with explicit indices: a negative index counts from the end of what is left,
+        # so "records[-1] records[-2]" in a row would drop the last real record too.
+        unset "records[$((n - 1))]" "records[$((n - 2))]"
+        if [[ $code != 0 ]]; then
+            note "gdir: git failed with exit code $code; showing a plain listing"
+            return 1
+        fi
+        unset -n records
+    done
+
+    # After "git rm --cached" a path is reported twice (D and ??); the later record wins.
+    prefix_l=${prefix,,}      # '' at the repository root, else 'sub/dir/'
+    for rec in "${statrecs[@]}"; do
+        (( ${#rec} < 4 )) && continue          # "XY path"
+        x=${rec:0:1} y=${rec:1:1} p=${rec:3}
+        state_of "$x" "$y"
+        st=$REPLY
+        p_l=${p,,}
+        isdirrec=0
+        [[ $p == */ ]] && isdirrec=1
+        if (( isdirrec )) && [[ $prefix_l == "$p_l"* ]]; then
+            base=$st          # an untracked or ignored directory that contains the directory
+        elif [[ $p_l == "$prefix_l"* ]]; then
+            rel=${p:${#prefix}}
+            rel=${rel%/}
+            pstate["k$rel"]=$st
+            if (( isdirrec )); then
+                k=$rel
+                (( FOLD )) && k=${rel,,}
+                COLLAPSED["$id|$k"]=$st
+            fi
+        fi
+    done
+
+    # Every status path adds its state to itself and to each directory above it.
+    for key in "${!pstate[@]}"; do
+        rel=${key#k}
+        st=${pstate[$key]}
+        bit=$(( 1 << st ))
+        rest=$rel
+        acc=''
+        while :; do
+            parent=$acc
+            if [[ $rest == */* ]]; then comp=${rest%%/*}; rest=${rest#*/}; last=0; else comp=$rest; rest=''; last=1; fi
+            acc=${acc:+$acc/}$comp
+            k=$acc
+            (( FOLD )) && k=${acc,,}
+            mk="$id|$k"
+            MASK[$mk]=$(( ${MASK[$mk]:-0} | bit ))
+            if (( st == DELETED )); then
+                gk=$parent
+                nkname=$comp
+                (( FOLD )) && { gk=${parent,,}; nkname=${comp,,}; }
+                gk="$id|$gk"
+                nk="$gk|$nkname"
+                if [[ -z ${GHOSTNAME[$nk]+x} ]]; then
+                    GHOSTNAME[$nk]=$comp
+                    GHOSTDIR[$nk]=$(( ! last ))
+                    GHOSTS[$gk]+=$comp$FS
+                elif (( ! last )); then
+                    GHOSTDIR[$nk]=1
+                fi
+            fi
+            (( last || ! deep )) && break
+        done
+    done
+
+    last=''
+    for f in "${filerecs[@]}"; do
+        [[ -z $f ]] && continue
+        if (( deep )); then
+            k=$f
+            (( FOLD )) && k=${f,,}
+            TRACKED["$id|$k"]=1
+            [[ $f == */* ]] || continue
+            d=${f%/*}
+            [[ $d == "$last" ]] && continue         # ls-files is sorted: same directory as before
+            last=$d
+            rest=$d
+            acc=''
+            while :; do                              # the directory and every directory above it
+                if [[ $rest == */* ]]; then comp=${rest%%/*}; rest=${rest#*/}; else comp=$rest; rest=''; fi
+                acc=${acc:+$acc/}$comp
+                k=$acc
+                (( FOLD )) && k=${acc,,}
+                TRACKED["$id|$k"]=1
+                [[ -z $rest ]] && break
+            done
+        else
+            top=${f%%/*}
+            [[ $top == "$last" ]] && continue        # one visit per top-level name
+            last=$top
+            k=$top
+            (( FOLD )) && k=${top,,}
+            TRACKED["$id|$k"]=1
+        fi
+    done
+    BASE[$id]=$base
+    GID=$id
+    return 0
+}
+
+# --- listing ---------------------------------------------------------------------------------
+
+# Splits the record $1 (fields separated by FS) into the array F.
+unpack() {
+    local - IFS=$FS
+    set -f
+    F=($1)
+}
+
+# Reads the entries below the directory $1 into REC, one record "directory FS name FS type FS
+# size FS mtime" each, sorted by directory and then by name like DIR (case-insensitive,
+# ordinal). The type is two letters: the kind of the entry itself and of what it points to (f
+# file, d directory, l link, N a link to nothing). DIRFIRST and DIRCOUNT tell where the records
+# of a directory are. $2 is 1 to read the whole tree, $3 is 1 to include entries whose names
+# start with a dot (.git is listed but never entered).
+declare -a REC=()
+declare -A DIRFIRST=() DIRCOUNT=()
+collect() {
+    local dir=$1 recursive=$2 dots=$3 data parent prev='' start=0 i n
+    local -a opts=(-mindepth 1)
+    local fmt='%h\001%f\001%y%Y\001%s\001%T@\0'
+    (( recursive )) || opts+=(-maxdepth 1)
+    DIRFIRST=()
+    DIRCOUNT=()
+    # The records come through a command substitution, the NUL that ends each one turned into \002
+    # (bash drops NUL), and are then split: "read -d ''" over a pipe is 20 times slower. The sort
+    # keeps the directories apart (case-sensitive), so that the records of one directory are next to
+    # each other, even for directories that differ only in case.
+    data=$(
+        if (( dots )); then
+            find -H "$dir" "${opts[@]}" \( -name .git -type d -prune -printf "$fmt" \) -o -printf "$fmt" 2>/dev/null
+        else
+            find -H "$dir" "${opts[@]}" \( -name '.*' -prune \) -o -printf "$fmt" 2>/dev/null
+        fi | LC_ALL=C sort -z -t "$FS" -k1,1 -k2,2f | tr '\0' '\002'
+    )
+    local - IFS=$'\002'
+    set -f
+    REC=($data)
+    n=${#REC[@]}
+    for (( i = 0; i < n; i++ )); do
+        parent=${REC[i]%%"$FS"*}
+        if [[ $parent != "$prev" ]]; then
+            [[ -n $prev ]] && DIRCOUNT[$prev]=$(( i - start ))
+            DIRFIRST[$parent]=$i
+            start=$i
+            prev=$parent
+        fi
+    done
+    [[ -n $prev ]] && DIRCOUNT[$prev]=$(( n - start ))
+    return 0
+}
+
+# Lays out cells column by column like DIR /W. The arrays plain and painted (of the caller)
+# hold the cells without and with color codes; the plain ones give the widths.
+format_columns() {
+    local width=$1 count=${#plain[@]} nrows ncols used maxcols i c r total w line pad len
+    local -a widths
+    maxcols=$(( width / 3 ))
+    (( maxcols > count )) && maxcols=$count
+    (( maxcols < 1 )) && maxcols=1
+    for (( ncols = maxcols; ncols >= 1; ncols-- )); do
+        nrows=$(( (count + ncols - 1) / ncols ))
+        used=$(( (count + nrows - 1) / nrows ))
+        widths=()
+        for (( c = 0; c < used; c++ )); do widths[c]=0; done
+        for (( i = 0; i < count; i++ )); do
+            c=$(( i / nrows ))
+            len=${#plain[i]}
+            (( len > widths[c] )) && widths[c]=$len
+        done
+        total=$(( 2 * (used - 1) ))
+        for w in "${widths[@]}"; do total=$(( total + w )); done
+        (( ncols == 1 || total <= width )) && break
+    done
+    for (( r = 0; r < nrows; r++ )); do
+        line=''
+        for (( c = 0; c < used; c++ )); do
+            i=$(( c * nrows + r ))
+            (( i >= count )) && break
+            line+=${painted[i]}
+            if (( i + nrows < count )); then
+                printf -v pad '%*s' $(( widths[c] - ${#plain[i]} + 2 )) ''
+                line+=$pad
+            fi
+        done
+        printf '%s\n' "$line"
+    done
+}
+
+TERM_WIDTH=0          # 0: one name per line, because the output is not a terminal
+if (( WIDE )) && [[ -t 1 ]]; then
+    TERM_WIDTH=${COLUMNS:-0}
+    [[ $TERM_WIDTH =~ ^[0-9]+$ ]] || TERM_WIDTH=0
+    if (( TERM_WIDTH == 0 )); then
+        # Ask the terminal that is our standard output. Not tput: inside $(...) its standard output is a
+        # pipe and its standard error is /dev/null, so it cannot see the terminal and answers 80.
+        exec {tty_fd}>&1
+        read -r _ TERM_WIDTH < <(stty size <&"$tty_fd" 2>/dev/null)
+        exec {tty_fd}>&-
+    fi
+    [[ $TERM_WIDTH =~ ^[0-9]+$ ]] && (( TERM_WIDTH > 0 )) || TERM_WIDTH=80
+fi
+
+# Prints the entries of the array named $1 (records "name FS rel FS isdir FS link FS state FS
+# size FS mtime FS ondisk"): names in columns with --wide, else tag, date, size and name.
+format_entries() {
+    local -n entries=$1
+    local n=${#entries[@]} i name k tag when size sizew=0 line
+    local -a plain=() painted=() sizes=() out=()
+    (( n )) || return 0
+    if (( WIDE )); then
+        for (( i = 0; i < n; i++ )); do
+            unpack "${entries[i]}"
+            name=${F[0]//[[:cntrl:]]/?}          # no terminal control codes from file names
+            (( F[2] )) && name="[$name]"
+            k=$NOSTATE
+            [[ -n ${F[4]} ]] && k=${F[4]}
+            plain[i]=$name
+            painted[i]=${PAINT_ON[k]}$name${PAINT_OFF[k]}
+        done
+        if (( TERM_WIDTH > 0 )); then format_columns "$TERM_WIDTH"; else printf '%s\n' "${painted[@]}"; fi
+        return 0
+    fi
+    for (( i = 0; i < n; i++ )); do
+        unpack "${entries[i]}"
+        if (( F[2] )); then size='<DIR>'
+        elif [[ ${F[7]} == 0 ]]; then size='-'
+        else printf -v size "%'d" "${F[5]}"
+        fi
+        sizes[i]=$size
+        (( ${#size} > sizew )) && sizew=${#size}
+    done
+    for (( i = 0; i < n; i++ )); do
+        unpack "${entries[i]}"
+        name=${F[0]//[[:cntrl:]]/?}
+        k=$NOSTATE
+        tag=' '
+        if [[ -n ${F[4]} ]]; then k=${F[4]}; tag=${STATE_TAG[k]}; fi
+        if [[ ${F[7]} == 1 ]]; then printf -v when '%(%Y-%m-%d %H:%M)T' "${F[6]}"; else printf -v when '%-16s' -; fi
+        printf -v line '%s%s%s %s %*s %s%s%s' "${PAINT_ON[k]}" "$tag" "${PAINT_OFF[k]}" "$when" "$sizew" "${sizes[i]}" "${PAINT_ON[k]}" "$name" "${PAINT_OFF[k]}"
+        out+=("$line")
+    done
+    printf '%s\n' "${out[@]}"
+}
+
+HEADERS_PRINTED=0     # blocks printed so far; a blank line goes between them
+FAILED=0              # a path could not be shown: exit code 2 at the end
+SHOW_HEADERS=0
+
+# Starts a block: the "Directory of" line, after a blank line unless it is the first block.
+write_header() {
+    (( HEADERS_PRINTED )) && echo
+    printf 'Directory of %s\n' "$1"
+    HEADERS_PRINTED=$(( HEADERS_PRINTED + 1 ))
+}
+
+# Says what could not be shown. The other paths are still shown, the exit code becomes 2.
+fail() {
+    printf 'gdir: %s\n' "$1" >&2
+    FAILED=1
+}
+
+# Entries that were asked for by name (--only), and the names that were found.
+declare -A ONLY=() SHOWN=()
+
+# Prints the directory $1 and, with --recurse, everything below it, depth first. $2 is the path
+# of the directory below the root that the git state $4 describes ('' at the root); $3 is the
+# state of the untracked or ignored directory that contains it (-1: none); $4 is empty without
+# git information. $5 is 1 to show just the entries named in ONLY (whatever their names).
+write_dir() {
+    local dir=$1 rel=$2 inherited=$3 gid=$4 only=${5:-0}
+    local first=${DIRFIRST[$dir]-} count=${DIRCOUNT[$dir]:-0} i name types size mtime isdir link
+    local child_rel state mask known k key relkey gname gk nk en child childgid childrel childinh collapsed marker rec
+    local -a ent=() subdirs=() ghosts=() gl=() sorted=()
+    local -A ondisk_names=()
+    if [[ ! -r $dir || ! -x $dir ]]; then
+        fail "cannot read '$dir': Permission denied"
+        return
+    fi
+    for (( i = first; i < first + count; i++ )); do
+        unpack "${REC[i]}"
+        name=${F[1]} types=${F[2]} size=${F[3]} mtime=${F[4]%%.*}
+        key=$name
+        (( FOLD )) && key=${name,,}
+        ondisk_names["k$key"]=1
+        if (( only )); then
+            [[ -n ${ONLY["k$key"]+x} ]] || continue
+            SHOWN["k$key"]=1
+        fi
+        link=0 isdir=0
+        [[ ${types:0:1} == l ]] && link=1
+        [[ ${types:1:1} == d ]] && isdir=1
+        child_rel=$name
+        [[ -n $rel ]] && child_rel=$rel/$name
+        state=''
+        if [[ -n $gid ]]; then
+            if (( inherited >= 0 )); then
+                state=$inherited
+            elif [[ $name == .git ]]; then
+                state=$IGNORED                              # git never reports its own directory
+            else
+                k=$child_rel
+                (( FOLD )) && k=${child_rel,,}
+                k="$gid|$k"
+                mask=${MASK[$k]:-0}
+                known=0
+                [[ -n ${MASK[$k]+x} ]] && known=1
+                if [[ -n ${TRACKED[$k]+x} ]]; then mask=$(( mask | CURRENT_BIT )); known=1; fi
+                if (( ! known )); then
+                    state=$UNMANAGED                        # git knows nothing about it, e.g. an empty directory
+                else
+                    # a directory that still exists is changed, not deleted
+                    if (( isdir && (mask & DELETED_BIT) )); then mask=$(( (mask & ~DELETED_BIT) | CHANGED_BIT )); fi
+                    state=$CONFLICT                         # the most severe state in the mask
+                    while (( state > 0 && (mask & (1 << state)) == 0 )); do state=$(( state - 1 )); done
+                fi
+            fi
+        fi
+        ent+=("$name$FS$child_rel$FS$isdir$FS$link$FS$state$FS$size$FS$mtime${FS}1")
+    done
+    # Deleted files are not on disk; list them from git, in their place.
+    if [[ -n $gid ]] && (( inherited < 0 )); then
+        relkey=$rel
+        (( FOLD )) && relkey=${rel,,}
+        gk="$gid|$relkey"
+        unpack "${GHOSTS[$gk]-}"
+        gl=("${F[@]}")
+        for gname in "${gl[@]}"; do
+            key=$gname
+            (( FOLD )) && key=${gname,,}
+            [[ -n ${ondisk_names["k$key"]+x} ]] && continue
+            if (( only )); then
+                [[ -n ${ONLY["k$key"]+x} ]] || continue
+                SHOWN["k$key"]=1
+            fi
+            nk="$gk|$key"
+            ghosts+=("${GHOSTNAME[$nk]}$FS${FS}${GHOSTDIR[$nk]}${FS}0${FS}$DELETED${FS}0${FS}0${FS}0")
+        done
+        if (( ${#ghosts[@]} )); then
+            # One sort for the entries on disk and the deleted ones: the order of a listing. (Placing
+            # each deleted entry by scanning the others takes minutes for thousands of them.)
+            while IFS= read -r -d '' rec; do sorted+=("${rec#*"$FS"}"); done < <(
+                for rec in "${ent[@]}" "${ghosts[@]}"; do printf '%s%s%s\0' "${rec%%"$FS"*}" "$FS" "$rec"; done | LC_ALL=C sort -z -f)
+            ent=("${sorted[@]}")
+        fi
+    fi
+    if (( only )); then
+        (( ${#ent[@]} )) || return
+    fi
+    (( SHOW_HEADERS )) && write_header "$dir"
+    format_entries ent
+    (( RECURSE && ! only )) || return 0
+    for (( i = 0; i < ${#ent[@]}; i++ )); do
+        unpack "${ent[i]}"
+        # on disk, a directory, not a link, not .git
+        [[ ${F[7]} == 1 && ${F[2]} == 1 && ${F[3]} == 0 && ${F[0]} != .git ]] && subdirs+=("${F[0]}$FS${F[1]}")
+    done
+    for en in "${subdirs[@]}"; do
+        name=${en%%"$FS"*}
+        child_rel=${en#*"$FS"}
+        child=$dir/$name
+        [[ $dir == / ]] && child=/$name
+        childgid=$gid childrel=$child_rel childinh=$inherited
+        marker=$child/.git
+        if [[ -e $marker || -L $marker ]]; then
+            # Another repository (submodule, nested clone): its own git state colors its files.
+            childrel='' childinh=-1
+            if read_git_state "$child" 1; then childgid=$GID childinh=${BASE[$GID]}; else childgid=''; fi
+        elif [[ -n $gid ]] && (( inherited < 0 )); then
+            k=$child_rel
+            (( FOLD )) && k=${child_rel,,}
+            collapsed=${COLLAPSED["$gid|$k"]-}
+            [[ -n $collapsed ]] && childinh=$collapsed
+        fi
+        write_dir "$child" "$childrel" "$childinh" "$childgid"
+    done
+}
+
+# --- what to show ----------------------------------------------------------------------------
+
+# Prints the named files of one directory, as the entries a listing of the directory would
+# show. $2 and $3 are lists (separated by FS) of the file names and of the arguments as typed.
+write_files() {
+    local dir=$1 names=$2 args=$3 name arg key gid='' inherited=-1
+    ONLY=() SHOWN=()
+    if read_git_state "$dir" 0; then gid=$GID inherited=${BASE[$GID]}; fi
+    collect "$dir" 0 1
+    while [[ -n $names ]]; do
+        name=${names%%"$FS"*}
+        names=${names#*"$FS"}
+        key=$name
+        (( FOLD )) && key=${name,,}
+        ONLY["k$key"]=1
+    done
+    write_dir "$dir" '' "$inherited" "$gid" 1
+    names=$2
+    while [[ -n $names ]]; do
+        name=${names%%"$FS"*}; names=${names#*"$FS"}
+        arg=${args%%"$FS"*}; args=${args#*"$FS"}
+        key=$name
+        (( FOLD )) && key=${name,,}
+        [[ -n ${SHOWN["k$key"]+x} ]] || fail "cannot access '$arg': no such file or directory"
+    done
+}
+
+declare -A WHOLE=()      # directory -> id of what git knows below it (read for deleted files in gone directories)
+
+# Deleted files whose directory is gone as well. Git still knows them: what it reports for the
+# nearest directory that exists tells which files below it are deleted. $1 is the directory
+# that is gone, $2 and $3 as for write_files.
+write_deleted_files() {
+    local dir=$1 names=$2 args=$3 ancestor=$1 gid='' below key gk nk name arg spelled
+    local -a ent=() keys=()
+    while [[ -n $ancestor && ! -d $ancestor ]]; do ancestor=${ancestor%/*}; done
+    [[ -z $ancestor ]] && ancestor=/
+    if [[ -z ${WHOLE[$ancestor]+x} ]]; then
+        if read_git_state "$ancestor" 1; then WHOLE[$ancestor]=$GID; else WHOLE[$ancestor]=; fi
+    fi
+    gid=${WHOLE[$ancestor]}
+    if [[ -n $gid ]] && (( ${BASE[$gid]} < 0 )); then
+        below=${dir#"$ancestor"}
+        below=${below#/}
+        key=$below
+        (( FOLD )) && key=${below,,}
+        gk="$gid|$key"
+    else
+        gk=
+    fi
+    while [[ -n $names ]]; do
+        name=${names%%"$FS"*}; names=${names#*"$FS"}
+        arg=${args%%"$FS"*}; args=${args#*"$FS"}
+        key=$name
+        (( FOLD )) && key=${name,,}
+        nk="$gk|$key"
+        if [[ -n $gk && -n ${GHOSTNAME[$nk]+x} ]]; then
+            spelled=${GHOSTNAME[$nk]}
+            ent+=("$spelled$FS${FS}${GHOSTDIR[$nk]}${FS}0${FS}$DELETED${FS}0${FS}0${FS}0")
+        else
+            fail "cannot access '$arg': no such file or directory"
+        fi
+    done
+    (( ${#ent[@]} )) || return 0
+    # same order as in a listing
+    local sorted=() rec
+    while IFS= read -r -d '' rec; do sorted+=("${rec#*"$FS"}"); done < <(
+        for rec in "${ent[@]}"; do printf '%s%s%s\0' "${rec%%"$FS"*}" "$FS" "$rec"; done | LC_ALL=C sort -z -f)
+    (( SHOW_HEADERS )) && write_header "$dir"
+    format_entries sorted
+}
+
+# Every directory argument is a block of its own. The file arguments of one directory form one
+# block, which stands where the first of them was given.
+TARGET_KIND=() TARGET_DIR=() TARGET_NAMES=() TARGET_ARGS=()
+declare -A FILE_TARGET=() SEEN=()
+(( ${#PATHS[@]} )) || PATHS=(.)
+for arg in "${PATHS[@]}"; do
+    if [[ -z $arg ]]; then fail "cannot access '': no such file or directory"; continue; fi
+    absolute_path "$arg"
+    full=$REPLY
+    key=$full
+    (( FOLD )) && key=${full,,}
+    [[ -n ${SEEN["k$key"]+x} ]] && continue
+    SEEN["k$key"]=1
+    if [[ -d $full ]]; then
+        TARGET_KIND+=(dir) TARGET_DIR+=("$full") TARGET_NAMES+=('') TARGET_ARGS+=('')
+        continue
+    fi
+    parent=${full%/*}
+    [[ -z $parent ]] && parent=/
+    key=$parent
+    (( FOLD )) && key=${parent,,}
+    if [[ -z ${FILE_TARGET["k$key"]+x} ]]; then
+        # gone: the directory does not exist (any more); only a deleted file can be found there
+        kind=files
+        [[ -d $parent ]] || kind=gone
+        FILE_TARGET["k$key"]=${#TARGET_KIND[@]}
+        TARGET_KIND+=("$kind") TARGET_DIR+=("$parent") TARGET_NAMES+=('') TARGET_ARGS+=('')
+    fi
+    idx=${FILE_TARGET["k$key"]}
+    TARGET_NAMES[idx]+=${full##*/}$FS
+    TARGET_ARGS[idx]+=$arg$FS
+done
+
+(( RECURSE || ${#TARGET_KIND[@]} > 1 )) && SHOW_HEADERS=1
+for (( t = 0; t < ${#TARGET_KIND[@]}; t++ )); do
+    dir=${TARGET_DIR[t]}
+    case ${TARGET_KIND[t]} in
+        gone) write_deleted_files "$dir" "${TARGET_NAMES[t]}" "${TARGET_ARGS[t]}" ;;
+        files) write_files "$dir" "${TARGET_NAMES[t]}" "${TARGET_ARGS[t]}" ;;
+        dir)
+            if [[ ! -r $dir || ! -x $dir ]]; then fail "cannot read '$dir': Permission denied"; continue; fi
+            gid='' inherited=-1
+            if read_git_state "$dir" "$RECURSE"; then gid=$GID inherited=${BASE[$GID]}; fi
+            collect "$dir" "$RECURSE" "$ALL"
+            write_dir "$dir" '' "$inherited" "$gid"
+            ;;
+    esac
+done
+exit $(( FAILED ? 2 : 0 ))

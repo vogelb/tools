@@ -8,6 +8,7 @@ This document was created with the help of AI — model: Claude Sonnet 5.5 (mode
 Name files instead, or as well, and it shows just those entries, the same way.
 A file that was deleted is gone from the disk, so `gdir` lists it from git as well.
 Outside a git work tree the listing is plain, with a note on stderr.
+There are two implementations with the same behavior, and both are called `gdir`: `gdir.ps1` (with `gdir.cmd`) runs in Windows PowerShell and `cmd.exe`, the bash script `gdir` in bash (Git Bash, WSL, Linux). All of them can sit in one folder on the `PATH` (`c:\tools`): every shell runs its own. The sections below describe `gdir.ps1`; the section *gdir (bash)* says how the bash script is used and where it differs.
 
 ```
 M 2026-09-03 15:03   8.175 build_articles.py
@@ -19,11 +20,13 @@ D -                      - company-product.schema.json
 ## Files
 | File | Purpose |
 |---|---|
-| `gdir.ps1` | The implementation, including the installer (`-Install`). Runs in Windows PowerShell 5.1 and PowerShell 7. |
+| `gdir.ps1` | The PowerShell implementation, including the installer (`-Install`). Runs in Windows PowerShell 5.1 and PowerShell 7. |
 | `gdir.cmd` | Starts `gdir.ps1` from `cmd.exe` (via Windows PowerShell, about 0.25 s start-up). |
-| `.gitattributes` | Keeps `gdir.cmd` on CRLF line endings; `cmd.exe` mis-parses LF-only batch files that contain non-ASCII characters. |
+| `gdir` | The bash implementation, including the installer (`--install`). Runs in Git Bash, WSL and Linux. |
+| `.gitattributes` | Keeps `gdir.cmd` on CRLF line endings (`cmd.exe` mis-parses LF-only batch files that contain non-ASCII characters) and `gdir` on LF (bash does not run a script with CRLF line endings). |
+| `test/test_gdir_sh.py` | Tests of the bash script `gdir` against a git oracle. See Tests. |
 
-## Usage
+## Usage (gdir.ps1)
 ```
 gdir [path...] [-Recurse] [-Wide] [-All] [-Color when] [-Legend]
 gdir -Install [folder]
@@ -79,7 +82,7 @@ A directory shows the most severe state inside it: conflict > changed > staged >
 A deleted file inside a directory makes the directory *changed*; *deleted* is only shown for entries that are gone.
 A directory that git does not know (for example an empty one) is *unmanaged*.
 
-## Configuration
+## Configuration (gdir.ps1)
 The colors are set in the configuration block at the top of `gdir.ps1`. It names the colors and gives every state one of them:
 
 ```powershell
@@ -121,7 +124,7 @@ because a wrapper may swallow git's exit code.
 
 Because renames are not detected, the old name of a renamed file is listed as *deleted* and the new name as *staged*.
 
-## Install
+## Install (gdir.ps1)
 `gdir -Install` copies `gdir.ps1` and `gdir.cmd` to a folder and puts that folder on the user `PATH`. Run it from the folder that holds the two files:
 
 ```powershell
@@ -138,3 +141,84 @@ From `cmd.exe`: `gdir.cmd -Install` or `gdir.cmd -Install D:\bin`.
 
 In PowerShell, `gdir` then runs `gdir.ps1` in the current session; in `cmd.exe` it runs `gdir.cmd`.
 Requirements: `git` on the `PATH` and an execution policy that allows local scripts (`Get-ExecutionPolicy`: RemoteSigned or less strict).
+
+## gdir (bash)
+The bash script `gdir` is the port of `gdir.ps1`: the same listing, states, colors, file lists, `Directory of` blocks and exit codes (`0`, `2`). It runs in Git Bash, WSL and Linux and needs bash 4.4 or newer, `git`, and GNU `find` and `sort`.
+
+### Usage
+```
+gdir [options] [path...]
+gdir --install [folder]
+gdir --help
+```
+
+| Option | Short | Description |
+|---|---|---|
+| `path...` | | Files and directories to show, as for `gdir.ps1`. The shell expands wildcards, not `gdir`. |
+| `--recurse` | `-r` | Also list the subdirectories, like `gdir -Recurse`. |
+| `--wide` | `-w` | Names only, in columns like `DIR /W`; directories in `[brackets]`. One name per line when the output is not a terminal. On a terminal the width is the one of the terminal, or `COLUMNS` if that is set. |
+| `--all` | `-a` | Also list entries whose names start with a dot, such as `.git`. Without it they are left out, like `ls` does. |
+| `--color=when` | | `auto` (default), `always` or `never`, as `-Color` of `gdir.ps1`. A bare `--color` means `always`. |
+| `--legend` | | Print the color key and exit. |
+| `--install` | | Copy `gdir` to a folder and add the folder to the `PATH` of new shells. See Install (bash). |
+| `--help` | `-h` | Print the usage page and exit. |
+
+Short options combine (`-ra`); `--` ends the options; `--help` anywhere shows the usage page.
+
+```
+gdir                    list the current directory
+gdir -r                 the whole tree below the current directory
+gdir a.txt ../b/c.txt   show just these files
+git diff -z --name-only --relative | xargs -0 -r gdir
+                        the files git reports as changed
+```
+
+### Differences from gdir.ps1
+- *Hidden* means a leading dot, as for `ls`: `.gitignore` is listed with `-a` only. `gdir.ps1` leaves out entries with the Hidden or System attribute instead, which on Windows are not the dot files.
+- The options are GNU style (`-r`, `--recurse`), not PowerShell parameters.
+- Paths in `Directory of` lines and in messages are spelled the way bash spells them (`/c/dev/x` in Git Bash). Paths you pass may use any spelling bash accepts, and in Git Bash also `C:\dev\x` and `C:/dev/x`.
+- Sizes get a thousands separator only if the locale defines one.
+- A directory link is what `find` reports as a symbolic link; in Git Bash that includes junctions. It is listed and, with `-r`, not entered.
+
+### Configuration (bash)
+The colors are set in the configuration block at the top of `gdir`: named colors (ANSI SGR codes) and the color of every state.
+
+```bash
+STATE_COLORS=(
+    [current]=$GREEN
+    [changed]=$YELLOW
+    [staged]=$LIGHTBLUE
+    [unmanaged]=$WHITE
+    [deleted]="$RED strike"
+    [conflict]="$WHITE bold on $RED"
+    [ignored]=$GRAY
+)
+```
+
+After the color a state can take `bold`, `strike` (strikethrough) and `on COLOR` (a background). A broken block stops `gdir` with exit code 2 and names the state; `gdir --legend` shows the colors in use.
+
+### Install (bash)
+`gdir --install [folder]` copies the script to a folder and makes it available in new shells:
+
+- The folder is created if needed. Default: `/c/tools` in Git Bash (the folder `gdir -Install` uses, too), else `~/.local/bin`. A copy that is already up to date is left alone, so running it again updates an installation.
+- Unless the folder is already on the `PATH`, the line `export PATH="$PATH":<folder>` is appended to `~/.bashrc` (once). Open a new shell, or run `source ~/.bashrc`.
+- The script is installed as `gdir`, next to `gdir.ps1` and `gdir.cmd` if `gdir -Install` put them in the same folder. If the folder already holds a folder named `gdir`, `--install` stops with exit code 2.
+
+### How the bash version works
+The three git queries of `gdir.ps1` run as background processes. The entries come from one `find -printf` and one `sort`, and the listing is made inside bash, without a process per entry. Two details come from Git Bash: git runs inside the directory (`cd`), not with `git -C`, because Git Bash cannot convert a path argument that contains `[` or `$` for a native Windows program; and a terminal's width is asked with `stty size`, because `tput` inside a command substitution cannot see the terminal.
+
+Speed: a small directory takes about 0.2 s in Git Bash; a directory with 8,000 entries (3,000 of them deleted files) takes about 5 s.
+
+## Tests
+`test/test_gdir_sh.py` tests the bash script `gdir` against a git oracle. It builds a sandbox repository with something in every state (modified, staged, untracked, ignored, deleted, conflicted, a nested repository, a linked worktree, a directory link, awkward file names), runs `gdir` on it and compares every tag, name, size, date and the order of the output with what `git status` and `git ls-files` report. It also covers colors, options, messages and exit codes, file lists, `--install` (in a throw-away `HOME`) and, on Linux and WSL, the automatic colors and the `--wide` columns on a pseudo terminal. On Windows with PowerShell 7 the output is also compared with the one of `gdir.ps1`.
+
+```
+python tools/gdir/test/test_gdir_sh.py             all tests (about 1 minute)
+python tools/gdir/test/test_gdir_sh.py -k colors   tests whose name contains "colors"
+python tools/gdir/test/test_gdir_sh.py --keep      keep test/.sandbox afterwards
+```
+
+- Needs Python 3.8+, `git` and bash 4.4+. On Windows the test finds Git Bash next to `git`; `GDIR_TEST_BASH` selects another bash.
+- The sandbox lives in `test/.sandbox` (not tracked by git, removed afterwards). `GDIR_TEST_SANDBOX` moves it, for example to a Linux file system that is case-sensitive and has permissions; the test only deletes a folder that it made itself or that is empty.
+- Nothing outside the repository is written (unless `GDIR_TEST_SANDBOX` says so). `--install` is only run with a folder of the sandbox, never with its default folder.
+- On Windows five tests are skipped: three need a pseudo terminal, one needs Unix file permissions (and a user who is not root), and one would install into the default folder of Linux. Run the suite in WSL to cover them: `python3 tools/gdir/test/test_gdir_sh.py` (as root the permissions test is skipped; `wsl -u nobody` runs it).

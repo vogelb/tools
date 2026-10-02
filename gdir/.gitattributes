@@ -1,3 +1,5 @@
 # cmd.exe mis-parses batch files with LF line endings and non-ASCII characters
 # (the em dash of the AI disclaimer); keep CRLF whatever core.autocrlf says.
 *.cmd text eol=crlf
+# bash does not run a script with CRLF line endings; keep LF whatever core.autocrlf says.
+/gdir text eol=lf
