@@ -1,19 +1,16 @@
 # gdir - DIR listing colored by git state
 
-## AI disclaimer
-This document was created with the help of AI — model: Claude Sonnet 5.5 (model ID: claude-sonnet-5.5)
-
 ## What it does
-`gdir` lists a directory like `DIR` (tag, date, size, name) and colors every entry by its state in git.
-Name files instead, or as well, and it shows just those entries, the same way.
+`gdir` lists a directory like `DIR` (a directory header, tag, date, size, name) and colors every entry by its state in git.  
 A file that was deleted is gone from the disk, so `gdir` lists it from git as well.
 Outside a git work tree the listing is plain, with a note on stderr.
-There are two implementations with the same behavior, and both are called `gdir`: `gdir.ps1` (with `gdir.cmd`) runs in Windows PowerShell and `cmd.exe`, the bash script `gdir` in bash (Git Bash, WSL, Linux). All of them can sit in one folder on the `PATH` (`c:\tools`): every shell runs its own. The sections below describe `gdir.ps1`; the section *gdir (bash)* says how the bash script is used and where it differs.
+There are two implementations with the same behavior, and both are called `gdir`: `gdir.ps1` (with `gdir.cmd`) runs in Windows PowerShell and `cmd.exe`, the bash script `gdir` in bash (Git Bash, WSL, Linux).  
+All of them can sit in one folder on the `PATH` (`c:\tools`): every shell runs its own. The sections below describe `gdir.ps1`; the section *gdir (bash)* says how the bash script is used and where it differs.
 
 ```
 M 2026-09-03 15:03   8.175 build_articles.py
 D -                      - company-product.schema.json
-? 2026-09-11 13:12 741.494 consolidated-articles.json
+? 9/11/2026 1:12:00 PM 741.494 consolidated-articles.json
   2026-09-02 13:17  34.003 asyncapi.bundle.yaml
 ```
 
@@ -37,8 +34,8 @@ gdir --help
 ### Arguments
 | Argument | Short | Default | Description |
 |---|---|---|---|
-| `path...` (or `-Path path,...`) | | current directory | Files and directories to show, separated by spaces or commas. A directory is listed (with `-Recurse`: with its subdirectories). A file shows just its own entry, even when it is hidden, and so does a file that git has deleted, even when its directory is gone too. With several paths, every directory and the files of every directory come below a `Directory of <path>` line; the files of one directory are shown together in `DIR` order, the blocks follow the order of the arguments, and a path given twice is shown once. A path must exist, otherwise the exit code is 2; the other paths are still shown. Quote a path that contains spaces. Wildcards are not expanded. With `-Install`: the folder to install into. |
-| `-Recurse` | `-r` | off | Also list the subdirectories, like `DIR /S`: every directory gets a `Directory of <path>` line, and the subdirectories follow depth first in `DIR` order. A subdirectory that is its own git repository (submodule, nested clone) is colored by that repository. The `.git` directory and directory links (junctions, symbolic links) are listed but not entered, and a directory that git reports as deleted is listed, not entered. Subdirectories that cannot be read are reported on stderr and skipped. |
+| `path...` (or `-Path path,...`) | | current directory | Files and directories to show, separated by spaces or commas. A directory is listed (with `-Recurse`: with its subdirectories). A file shows just its own entry, even when it is hidden, and so does a file that git has deleted, even when its directory is gone too. A top-level block in a Git work tree starts with `Branch <name> [<upstream>]: up to date` above its localized `DIR`-style directory header. The local branch is green and its upstream is blue when color is enabled. Branches ahead or behind show only the relevant counts, such as `+2`, `-1`, or `+2 -1`. A branch without an upstream shows `Branch <name>: no upstream`. The files of one directory are shown together in `DIR` order, the blocks follow the order of the arguments, and a path given twice is shown once. A path must exist, otherwise the exit code is 2; the other paths are still shown. Quote a path that contains spaces. Wildcards are not expanded. With `-Install`: the folder to install into. |
+| `-Recurse` | `-r` | off | Also list the subdirectories, like `DIR /S`: every directory gets a localized directory-header line, and the subdirectories follow depth first in `DIR` order. The branch line is shown only for each top-level argument, not recursive child blocks. A subdirectory that is its own git repository (submodule, nested clone) is colored by that repository. The `.git` directory and directory links (junctions, symbolic links) are listed but not entered, and a directory that git reports as deleted is listed, not entered. Subdirectories that cannot be read are reported on stderr and skipped. |
 | `-Wide` | `-w` | off | Names only, in columns like `DIR /W`; directories in `[brackets]`. One name per line when the output is not a terminal. |
 | `-All` | `-a` | off | Also list entries with the Hidden or System attribute, such as `.git`. Without it they are left out, like `DIR` does. Deleted files are always listed. |
 | `-Color when` | | `auto` | `auto`: color only on a terminal and only if the `NO_COLOR` environment variable is not set. `always`: color even when the output is redirected. `never`: plain text. |
@@ -56,7 +53,7 @@ Exit codes: `0` listing printed (a plain one, with a note on stderr, outside a g
 gdir                    list the current directory
 gdir ..\other           list another directory
 gdir a.txt ..\b\c.txt   show just these files
-gdir src a.txt          a directory and a file, each below a Directory of line
+gdir src a.txt          a directory and a file, each below a localized directory header
 gdir (git diff --name-only --relative)
                         the files git reports as changed (PowerShell)
 gdir -r                 the whole tree below the current directory
@@ -69,7 +66,7 @@ gdir -Install D:\bin    the same for another folder
 ## States
 | State | Color | Tag | Meaning |
 |---|---|---|---|
-| current | green | blank | tracked, unchanged |
+| current | green | `✓` | tracked, unchanged |
 | changed | yellow | `M` | modified in the working tree |
 | staged | light blue | `+` | changes staged in the index, nothing newer in the working tree |
 | unmanaged | white | `?` | untracked: git does not manage it |
@@ -143,7 +140,7 @@ In PowerShell, `gdir` then runs `gdir.ps1` in the current session; in `cmd.exe` 
 Requirements: `git` on the `PATH` and an execution policy that allows local scripts (`Get-ExecutionPolicy`: RemoteSigned or less strict).
 
 ## gdir (bash)
-The bash script `gdir` is the port of `gdir.ps1`: the same listing, states, colors, file lists, `Directory of` blocks and exit codes (`0`, `2`). It runs in Git Bash, WSL and Linux and needs bash 4.4 or newer, `git`, and GNU `find` and `sort`.
+The bash script `gdir` is the port of `gdir.ps1`: the same listing, states, colors, file lists, localized directory-header blocks and exit codes (`0`, `2`). It runs in Git Bash, WSL and Linux and needs bash 4.4 or newer, `git`, and GNU `find` and `sort`.
 
 ### Usage
 ```
@@ -176,7 +173,7 @@ git diff -z --name-only --relative | xargs -0 -r gdir
 ### Differences from gdir.ps1
 - *Hidden* means a leading dot, as for `ls`: `.gitignore` is listed with `-a` only. `gdir.ps1` leaves out entries with the Hidden or System attribute instead, which on Windows are not the dot files.
 - The options are GNU style (`-r`, `--recurse`), not PowerShell parameters.
-- Paths in `Directory of` lines and in messages are spelled the way bash spells them (`/c/dev/x` in Git Bash). Paths you pass may use any spelling bash accepts, and in Git Bash also `C:\dev\x` and `C:/dev/x`.
+- Paths in directory-header lines and in messages are spelled the way bash spells them (`/c/dev/x` in Git Bash). Paths you pass may use any spelling bash accepts, and in Git Bash also `C:\dev\x` and `C:/dev/x`.
 - Sizes get a thousands separator only if the locale defines one.
 - A directory link is what `find` reports as a symbolic link; in Git Bash that includes junctions. It is listed and, with `-r`, not entered.
 

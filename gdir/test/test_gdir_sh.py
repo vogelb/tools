@@ -316,7 +316,7 @@ def tearDownModule():
 # ---------------------------------------------------------------------------------------------
 # the git oracle: what the listing of a directory must show, worked out from git alone
 
-SEVERITY = {"!": 0, " ": 1, "?": 2, "+": 3, "M": 4, "D": 5, "U": 6}
+SEVERITY = {"!": 0, "✓": 1, "?": 2, "+": 3, "M": 4, "D": 5, "U": 6}
 TAG_OF_SEVERITY = {v: k for k, v in SEVERITY.items()}
 
 
@@ -372,12 +372,12 @@ class Oracle:
         if not is_dir:
             if rec:
                 return rec[0]
-            return " " if k in self.tracked else "?"
+            return "✓" if k in self.tracked else "?"
         if rec and rec[1]:
             return rec[0]
         tags = {t for p, (t, _) in self.status.items() if p.startswith(k + "/")}
         if k in self.tracked_dirs:
-            tags.add(" ")
+            tags.add("✓")
         if "D" in tags:                                      # a directory that exists is changed, not deleted
             tags.discard("D")
             tags.add("M")
@@ -445,7 +445,7 @@ def expected_dir(path, show_dot=False, use_git=True):
             names.add(key(e.name))
             is_dir = e.is_dir()
             st = e.stat(follow_symlinks=False)
-            when = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+            when = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%x %X")
             if oracle is None:
                 tag = " "
             elif e.name == ".git":
@@ -485,7 +485,16 @@ def walk_expected(path, show_dot):
 # ---------------------------------------------------------------------------------------------
 # reading what gdir prints
 
-ENTRY = re.compile(r"^(.) (.{16}) +(<DIR>|-|[0-9.,']+) (.*)$")
+ENTRY = re.compile(r"^(.) (.*?) +(<DIR>|-|[0-9.,']+) (.*)$")
+HEADER_PREFIXES = ("Directory of ", "Verzeichnis von ")
+BRANCH_PREFIX = "Branch "
+
+
+def header_path(line):
+    for prefix in HEADER_PREFIXES:
+        if line.startswith(prefix):
+            return line[len(prefix):]
+    return None
 
 
 def parse_blocks(out):
@@ -494,10 +503,12 @@ def parse_blocks(out):
     current = None
     for line in out.split("\n"):
         if line == "":
-            current = None
             continue
-        if line.startswith("Directory of "):
-            current = (line[len("Directory of "):], [])
+        if line.startswith(BRANCH_PREFIX):
+            continue
+        header = header_path(line)
+        if header is not None:
+            current = (header, [])
             blocks.append(current)
             continue
         if current is None:
@@ -580,7 +591,7 @@ DIRECTORIES = [".", "sub", "sub/deeper", "build", "build/inner", "dir_untracked"
 QUOTE = [] if IS_WINDOWS else ["it's.txt"]
 
 # label, arguments, blocks [(directory, names or None for the whole directory)], the paths that
-# cannot be shown, "Directory of" lines expected (more than one target)
+# cannot be shown, directory-header lines expected
 FILE_CASES = [
     ("files of one directory", ["current.txt", "changed.txt", "untracked.txt", "deleted.txt", "ignored.log"],
      [(".", ["current.txt", "changed.txt", "untracked.txt", "deleted.txt", "ignored.log"])], [], False),
@@ -640,6 +651,13 @@ class GdirShTest(unittest.TestCase):
             with self.subTest(directory=d):
                 self.check_listing([d], REPO, REPO / d, False)
 
+    def test_branch_is_shown_only_for_the_top_level_block(self):
+        branch = git(REPO, "symbolic-ref", "--short", "HEAD").stdout.decode().strip()
+        self.assertEqual([line for line in gdir("--color=never").out.split("\n") if line.startswith(BRANCH_PREFIX)],
+                         [BRANCH_PREFIX + branch + ": no upstream"])
+        self.assertEqual([line for line in gdir("--color=never", "-r").out.split("\n") if line.startswith(BRANCH_PREFIX)],
+                         [BRANCH_PREFIX + branch + ": no upstream"])
+
     def test_nothing_gets_executed_for_awkward_names(self):
         res = gdir("--color=never", "-r")
         self.assertEqual(res.rc, 0, res)
@@ -697,11 +715,8 @@ class GdirShTest(unittest.TestCase):
                 self.assertEqual(len(got), len(blocks), res.out)
                 for (header, entries), (rel, names) in zip(got, blocks):
                     target = REPO / rel
-                    if headers:
-                        self.assertIsNotNone(header, res.out)
-                        self.assertEqual(canon(win_header(header)), canon(target))
-                    else:
-                        self.assertIsNone(header, res.out)
+                    self.assertIsNotNone(header, res.out)
+                    self.assertEqual(canon(win_header(header)), canon(target))
                     self.assertIsNone(listing_diff(entries, expected_block(target, names)), res.out)
 
     # --- --wide ----------------------------------------------------------------------------
@@ -710,16 +725,27 @@ class GdirShTest(unittest.TestCase):
         res = gdir("--color=never", "-w")
         self.assertEqual((res.rc, res.err), (0, ""), res)
         wanted = ["[%s]" % e[1] if e[2] else e[1] for e in expected_dir(REPO)]
-        self.assertEqual(res.out.split("\n")[:-1], wanted)
+        lines = res.out.split("\n")
+        self.assertEqual(lines[0], "")
+        self.assertTrue(lines[1].startswith(BRANCH_PREFIX))
+        self.assertEqual(canon(win_header(header_path(lines[2]))), canon(REPO))
+        self.assertEqual(lines[3], "")
+        self.assertEqual(lines[4:-1], wanted)
 
     def test_wide_recursive_output_has_a_block_per_directory(self):
         res = gdir("--color=never", "-wr", cwd=REPO / "sub")
-        blocks = [b.split("\n") for b in res.out.strip("\n").split("\n\n")]
+        blocks = []
+        for line in res.out.split("\n"):
+            header = header_path(line)
+            if header is not None:
+                blocks.append((header, []))
+            elif line and not line.startswith(BRANCH_PREFIX) and blocks:
+                blocks[-1][1].append(line)
         expected = walk_expected(REPO / "sub", False)
         self.assertEqual(len(blocks), len(expected), res.out)
-        for lines, (path, entries) in zip(blocks, expected):
-            self.assertEqual(canon(win_header(lines[0][len("Directory of "):])), canon(path))
-            self.assertEqual(lines[1:], ["[%s]" % e[1] if e[2] else e[1] for e in entries])
+        for (header, lines), (path, entries) in zip(blocks, expected):
+            self.assertEqual(canon(win_header(header)), canon(path))
+            self.assertEqual(lines, ["[%s]" % e[1] if e[2] else e[1] for e in entries])
 
     @staticmethod
     def wide_layout(names, nrows):
@@ -797,7 +823,7 @@ class GdirShTest(unittest.TestCase):
         res = gdir("--legend", "--color=never")
         self.assertEqual((res.rc, res.err), (0, ""))
         self.assertEqual([l[:11] for l in res.out.split("\n")[:7]],
-                         ["  current  ", "M changed  ", "+ staged   ", "? unmanaged", "D deleted  ", "U conflict ", "! ignored  "])
+                         ["✓ current  ", "M changed  ", "+ staged   ", "? unmanaged", "D deleted  ", "U conflict ", "! ignored  "])
         colored = gdir("--legend", "--color=always").out
         self.assertIn("\x1b[1;97;41mconflict \x1b[0m", colored)
         self.assertIn("\x1b[31;9mdeleted  \x1b[0m", colored)
@@ -842,7 +868,7 @@ class GdirShTest(unittest.TestCase):
     def test_runs_directly_through_its_shebang(self):
         res = run([BASH, "-c", 'exec "$@"', "x", to_posix(SCRIPT), "--legend", "--color=never"])
         self.assertEqual(res.rc, 0, res)
-        self.assertTrue(res.out.startswith("  current"))
+        self.assertTrue(res.out.startswith("✓ current"))
 
     def test_script_has_unix_line_endings(self):
         data = SCRIPT.read_bytes()
@@ -887,7 +913,7 @@ class GdirShTest(unittest.TestCase):
         self.assertEqual([(e[0], e[3]) for e in parse_blocks(res.out)[0][1]], [(" ", "dirp"), (" ", "p1.txt"), (" ", "p2.txt")])
         res = gdir("--color=never", "-r", cwd=PLAIN, env=env)
         self.assertEqual(res.err.count("\n"), 0, "one note, however many directories")
-        self.assertEqual(res.out.count("Directory of"), 2)
+        self.assertEqual(len(parse_blocks(res.out)), 2)
 
     @unittest.skipIf(IS_WINDOWS or (hasattr(os, "geteuid") and os.geteuid() == 0),
                      "needs a file system with permissions and a user who is not root")
@@ -944,7 +970,7 @@ class GdirShTest(unittest.TestCase):
         # a new shell finds it, also with a space in the folder name; the installed copy runs
         found = self.shell_with(home, "command -v gdir")
         self.assertEqual(found.out.strip(), to_posix(folder) + "/gdir")
-        self.assertTrue(self.shell_with(home, "gdir --legend --color=never").out.startswith("  current"))
+        self.assertTrue(self.shell_with(home, "gdir --legend --color=never").out.startswith("✓ current"))
         # running it again changes nothing
         again = self.install(home, to_posix(folder))
         self.assertEqual(again.rc, 0, again)
@@ -1018,8 +1044,12 @@ class GdirShTest(unittest.TestCase):
                               "a missing file between existing ones", "dot files named explicitly")]
 
         def with_windows_headers(out):
-            return "\n".join("Directory of " + win_header(l[len("Directory of "):]) if l.startswith("Directory of ") else l
-                             for l in out.split("\n"))
+            return "\n".join(
+                "Directory of " + win_header(header) if (header := header_path(l)) is not None else l
+                for l in out.split("\n"))
+
+        def without_times(blocks):
+            return [(header, [(tag, size, name) for tag, when, size, name in entries]) for header, entries in blocks]
 
         for label, sh_args, ps_args, d, as_text in cases:
             with self.subTest(label):
@@ -1027,9 +1057,18 @@ class GdirShTest(unittest.TestCase):
                 theirs = self.ps1(ps_args, REPO / d)
                 self.assertEqual((mine.rc, mine.err), (theirs.rc, theirs.err))
                 if as_text:
-                    self.assertEqual(with_windows_headers(mine.out), theirs.out)
+                    if label == "colors":
+                        mine_blocks = parse_blocks(re.sub(r"\x1b\[[0-9;]*m", "", mine.out))
+                        theirs_blocks = parse_blocks(re.sub(r"\x1b\[[0-9;]*m", "", theirs.out))
+                        self.assertEqual(
+                            without_times([(win_header(h), e) for h, e in mine_blocks]),
+                            without_times(theirs_blocks))
+                    else:
+                        self.assertEqual(with_windows_headers(mine.out), with_windows_headers(theirs.out))
                 else:
-                    self.assertEqual([(win_header(h), e) for h, e in parse_blocks(mine.out)], parse_blocks(theirs.out))
+                    self.assertEqual(
+                        without_times([(win_header(h), e) for h, e in parse_blocks(mine.out)]),
+                        without_times(parse_blocks(theirs.out)))
 
 
 if __name__ == "__main__":

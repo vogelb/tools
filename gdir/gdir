@@ -54,7 +54,7 @@ declare -A STATE_COLORS=(
 IGNORED=0 CURRENT=1 UNMANAGED=2 STAGED=3 CHANGED=4 DELETED=5 CONFLICT=6
 NOSTATE=7        # index of the "no git information" entry in the PAINT arrays
 STATE_LABEL=(ignored current unmanaged staged changed deleted conflict)
-STATE_TAG=('!' ' ' '?' '+' 'M' 'D' 'U')
+STATE_TAG=('!' '✓' '?' '+' 'M' 'D' 'U')
 STATE_TEXT=(
     'matches .gitignore'
     'tracked, unchanged'
@@ -90,10 +90,12 @@ Arguments:
                 A directory is listed, a file shows just its own entry (also a
                 dot file, and a file that git has deleted, even when its
                 directory is gone too). With several paths, each directory and
-                the files of each directory come below a "Directory of" line.
+                the files of each directory come below a localized directory
+                header line.
                 A path must exist, otherwise the exit code is 2; the other
                 paths are still shown. The shell expands wildcards.
-  -r, --recurse Also list the subdirectories, each below a "Directory of" line,
+  -r, --recurse Also list the subdirectories, each below a localized directory
+                header line,
                 like DIR /S. A subdirectory that is its own git repository is
                 colored by that repository. Listed but not entered: .git and
                 symbolic links.
@@ -382,8 +384,9 @@ read_git_state() {
     fi
     id=$(( ++GIT_SERIAL ))
     # The three queries run at the same time, inside $dir (cd, not git -C): in Git Bash git is a native
-    # Windows program, and the conversion of a path argument fails for names with [ or $.
-    exec {sfd}< <(cd "$dir" 2>/dev/null && git --no-optional-locks status --porcelain=v1 -z --no-renames --ignored=matching --untracked-files=normal -- . 2>/dev/null; printf 'GDIR-EXIT\0%s\0' "$?")
+    # Windows program, and the conversion of a path argument fails for names with [ or $. Keep status
+    # options compatible with older Git versions commonly installed in WSL.
+    exec {sfd}< <(cd "$dir" 2>/dev/null && git -c status.renames=false status --porcelain=v1 -z --ignored --untracked-files=normal -- . 2>/dev/null; printf 'GDIR-EXIT\0%s\0' "$?")
     exec {ffd}< <(cd "$dir" 2>/dev/null && git ls-files -z -- . 2>/dev/null; printf 'GDIR-EXIT\0%s\0' "$?")
     if ! prefix=$(cd "$dir" 2>/dev/null && git rev-parse --show-prefix 2>/dev/null); then
         exec {sfd}<&- {ffd}<&-
@@ -612,8 +615,8 @@ fi
 # size FS mtime FS ondisk"): names in columns with --wide, else tag, date, size and name.
 format_entries() {
     local -n entries=$1
-    local n=${#entries[@]} i name k tag when size sizew=0 line
-    local -a plain=() painted=() sizes=() out=()
+    local n=${#entries[@]} i name k tag when size sizew=0 timew=1 line
+    local -a plain=() painted=() sizes=() times=() out=()
     (( n )) || return 0
     if (( WIDE )); then
         for (( i = 0; i < n; i++ )); do
@@ -636,6 +639,9 @@ format_entries() {
         fi
         sizes[i]=$size
         (( ${#size} > sizew )) && sizew=${#size}
+        if [[ ${F[7]} == 1 ]]; then printf -v when '%(%x %X)T' "${F[6]}"; else when='-'; fi
+        times[i]=$when
+        (( ${#when} > timew )) && timew=${#when}
     done
     for (( i = 0; i < n; i++ )); do
         unpack "${entries[i]}"
@@ -643,8 +649,7 @@ format_entries() {
         k=$NOSTATE
         tag=' '
         if [[ -n ${F[4]} ]]; then k=${F[4]}; tag=${STATE_TAG[k]}; fi
-        if [[ ${F[7]} == 1 ]]; then printf -v when '%(%Y-%m-%d %H:%M)T' "${F[6]}"; else printf -v when '%-16s' -; fi
-        printf -v line '%s%s%s %s %*s %s%s%s' "${PAINT_ON[k]}" "$tag" "${PAINT_OFF[k]}" "$when" "$sizew" "${sizes[i]}" "${PAINT_ON[k]}" "$name" "${PAINT_OFF[k]}"
+        printf -v line '%s%s%s %-*s %*s %s%s%s' "${PAINT_ON[k]}" "$tag" "${PAINT_OFF[k]}" "$timew" "${times[i]}" "$sizew" "${sizes[i]}" "${PAINT_ON[k]}" "$name" "${PAINT_OFF[k]}"
         out+=("$line")
     done
     printf '%s\n' "${out[@]}"
@@ -654,10 +659,61 @@ HEADERS_PRINTED=0     # blocks printed so far; a blank line goes between them
 FAILED=0              # a path could not be shown: exit code 2 at the end
 SHOW_HEADERS=0
 
-# Starts a block: the "Directory of" line, after a blank line unless it is the first block.
+# Starts a block: the localized directory-header line, after a blank line unless it is the first block.
+case ${LC_ALL:-${LC_MESSAGES:-${LANG:-}}} in
+    de*|de_*) DIRECTORY_HEADER='Verzeichnis von' ;;
+    *)          DIRECTORY_HEADER='Directory of' ;;
+esac
+
+BRANCH=
+BRANCH_STATUS=
+read_branch_status() {
+    local dir=$1 raw line upstream='' ahead=0 behind=0
+    BRANCH=
+    BRANCH_STATUS=
+    raw=$(cd "$dir" 2>/dev/null && git status --porcelain=v2 --branch --untracked-files=no 2>/dev/null) || return
+    while IFS= read -r line; do
+        case $line in
+            '# branch.head '*) BRANCH=${line#\# branch.head } ;;
+            '# branch.upstream '*) upstream=${line#\# branch.upstream } ;;
+            '# branch.ab '*)
+                if [[ $line =~ ^\#\ branch\.ab\ \+([0-9]+)\ -([0-9]+)$ ]]; then
+                    ahead=${BASH_REMATCH[1]}
+                    behind=${BASH_REMATCH[2]}
+                fi
+                ;;
+        esac
+    done <<< "$raw"
+    [[ -n $BRANCH && $BRANCH != '(detached)' ]] || BRANCH=
+    [[ -n $BRANCH ]] || return
+    if [[ -z $upstream ]]; then
+        BRANCH_STATUS=': no upstream'
+    else
+        if (( use_color )); then
+            BRANCH_STATUS=" ["
+            BRANCH_STATUS+=$'\e['"$BLUE"m"$upstream"$'\e[0m'
+            BRANCH_STATUS+="]: "
+        else
+            BRANCH_STATUS=" [$upstream]: "
+        fi
+        if (( ahead == 0 && behind == 0 )); then
+            BRANCH_STATUS+='up to date'
+        else
+            (( ahead > 0 )) && BRANCH_STATUS+="+$ahead"
+            (( ahead > 0 && behind > 0 )) && BRANCH_STATUS+=' '
+            (( behind > 0 )) && BRANCH_STATUS+="-$behind"
+        fi
+    fi
+}
+
 write_header() {
-    (( HEADERS_PRINTED )) && echo
-    printf 'Directory of %s\n' "$1"
+    local dir=$1 branch=$2 status=$3
+    if [[ -n $branch ]]; then
+        if (( use_color )); then branch=$'\e['"$GREEN"m"$branch"$'\e[0m'; fi
+        printf '\nBranch %s%s\n%s %s\n\n' "$branch" "$status" "$DIRECTORY_HEADER" "$dir"
+    else
+        printf '\n%s %s\n\n' "$DIRECTORY_HEADER" "$dir"
+    fi
     HEADERS_PRINTED=$(( HEADERS_PRINTED + 1 ))
 }
 
@@ -675,7 +731,7 @@ declare -A ONLY=() SHOWN=()
 # state of the untracked or ignored directory that contains it (-1: none); $4 is empty without
 # git information. $5 is 1 to show just the entries named in ONLY (whatever their names).
 write_dir() {
-    local dir=$1 rel=$2 inherited=$3 gid=$4 only=${5:-0}
+    local dir=$1 rel=$2 inherited=$3 gid=$4 only=${5:-0} branch=${6:-} branch_status=${7:-}
     local first=${DIRFIRST[$dir]-} count=${DIRCOUNT[$dir]:-0} i name types size mtime isdir link
     local child_rel state mask known k key relkey gname gk nk en child childgid childrel childinh collapsed marker rec
     local -a ent=() subdirs=() ghosts=() gl=() sorted=()
@@ -754,7 +810,7 @@ write_dir() {
     if (( only )); then
         (( ${#ent[@]} )) || return
     fi
-    (( SHOW_HEADERS )) && write_header "$dir"
+    (( SHOW_HEADERS )) && write_header "$dir" "$branch" "$branch_status"
     format_entries ent
     (( RECURSE && ! only )) || return 0
     for (( i = 0; i < ${#ent[@]}; i++ )); do
@@ -788,9 +844,15 @@ write_dir() {
 # Prints the named files of one directory, as the entries a listing of the directory would
 # show. $2 and $3 are lists (separated by FS) of the file names and of the arguments as typed.
 write_files() {
-    local dir=$1 names=$2 args=$3 name arg key gid='' inherited=-1
+    local dir=$1 names=$2 args=$3 name arg key gid='' inherited=-1 branch='' branch_status=''
     ONLY=() SHOWN=()
-    if read_git_state "$dir" 0; then gid=$GID inherited=${BASE[$GID]}; fi
+    if read_git_state "$dir" 0; then
+        gid=$GID
+        inherited=${BASE[$GID]}
+        read_branch_status "$dir"
+        branch=$BRANCH
+        branch_status=$BRANCH_STATUS
+    fi
     collect "$dir" 0 1
     while [[ -n $names ]]; do
         name=${names%%"$FS"*}
@@ -799,7 +861,7 @@ write_files() {
         (( FOLD )) && key=${name,,}
         ONLY["k$key"]=1
     done
-    write_dir "$dir" '' "$inherited" "$gid" 1
+    write_dir "$dir" '' "$inherited" "$gid" 1 "$branch" "$branch_status"
     names=$2
     while [[ -n $names ]]; do
         name=${names%%"$FS"*}; names=${names#*"$FS"}
@@ -816,7 +878,7 @@ declare -A WHOLE=()      # directory -> id of what git knows below it (read for 
 # nearest directory that exists tells which files below it are deleted. $1 is the directory
 # that is gone, $2 and $3 as for write_files.
 write_deleted_files() {
-    local dir=$1 names=$2 args=$3 ancestor=$1 gid='' below key gk nk name arg spelled
+    local dir=$1 names=$2 args=$3 ancestor=$1 gid='' branch='' branch_status='' below key gk nk name arg spelled
     local -a ent=() keys=()
     while [[ -n $ancestor && ! -d $ancestor ]]; do ancestor=${ancestor%/*}; done
     [[ -z $ancestor ]] && ancestor=/
@@ -824,6 +886,11 @@ write_deleted_files() {
         if read_git_state "$ancestor" 1; then WHOLE[$ancestor]=$GID; else WHOLE[$ancestor]=; fi
     fi
     gid=${WHOLE[$ancestor]}
+    if [[ -n $gid ]]; then
+        read_branch_status "$ancestor"
+        branch=$BRANCH
+        branch_status=$BRANCH_STATUS
+    fi
     if [[ -n $gid ]] && (( ${BASE[$gid]} < 0 )); then
         below=${dir#"$ancestor"}
         below=${below#/}
@@ -851,7 +918,7 @@ write_deleted_files() {
     local sorted=() rec
     while IFS= read -r -d '' rec; do sorted+=("${rec#*"$FS"}"); done < <(
         for rec in "${ent[@]}"; do printf '%s%s%s\0' "${rec%%"$FS"*}" "$FS" "$rec"; done | LC_ALL=C sort -z -f)
-    (( SHOW_HEADERS )) && write_header "$dir"
+    (( SHOW_HEADERS )) && write_header "$dir" "$branch" "$branch_status"
     format_entries sorted
 }
 
@@ -888,7 +955,7 @@ for arg in "${PATHS[@]}"; do
     TARGET_ARGS[idx]+=$arg$FS
 done
 
-(( RECURSE || ${#TARGET_KIND[@]} > 1 )) && SHOW_HEADERS=1
+SHOW_HEADERS=1
 for (( t = 0; t < ${#TARGET_KIND[@]}; t++ )); do
     dir=${TARGET_DIR[t]}
     case ${TARGET_KIND[t]} in
@@ -897,9 +964,16 @@ for (( t = 0; t < ${#TARGET_KIND[@]}; t++ )); do
         dir)
             if [[ ! -r $dir || ! -x $dir ]]; then fail "cannot read '$dir': Permission denied"; continue; fi
             gid='' inherited=-1
-            if read_git_state "$dir" "$RECURSE"; then gid=$GID inherited=${BASE[$GID]}; fi
+            branch=''
+            if read_git_state "$dir" "$RECURSE"; then
+                gid=$GID
+                inherited=${BASE[$GID]}
+                read_branch_status "$dir"
+                branch=$BRANCH
+                branch_status=$BRANCH_STATUS
+            fi
             collect "$dir" "$RECURSE" "$ALL"
-            write_dir "$dir" '' "$inherited" "$gid"
+            write_dir "$dir" '' "$inherited" "$gid" 0 "$branch" "$branch_status"
             ;;
     esac
 done

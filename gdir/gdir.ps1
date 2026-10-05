@@ -18,7 +18,7 @@ gdir -Install copies gdir to a folder (default c:\tools) and puts that folder on
 Files and directories to show, separated by spaces or commas. Default: the current directory.
 A directory is listed; a file shows just its own entry, even when it is hidden, and so does a
 file that git has deleted, even if its directory is gone as well. With several paths, every
-directory and the files of every directory come below a "Directory of" line. A path must
+directory and the files of every directory come below a localized directory-header line. A path must
 exist, otherwise the exit code is 2 (the other paths are still shown); quote it if it
 contains spaces. Wildcards are not expanded.
 With -Install: the folder to install into, default c:\tools.
@@ -31,7 +31,7 @@ One name per line when the output is not a terminal.
 Short form -a. Also list entries with the Hidden or System attribute (such as .git).
 
 .PARAMETER Recurse
-Short form -r. Also lists the subdirectories, each below a "Directory of" line, like DIR /S.
+Short form -r. Also lists the subdirectories, each below a localized directory-header line, like DIR /S.
 A subdirectory that is its own git repository (submodule, nested clone) is colored by that
 repository. The .git directory and directory links are listed but not entered. Subdirectories
 that cannot be read are reported on stderr.
@@ -146,7 +146,7 @@ $IGNORED = 0; $CURRENT = 1; $UNMANAGED = 2; $STAGED = 3; $CHANGED = 4; $DELETED 
 # the state's color) is added below from the configuration block.
 $Style = @(
     @{ Label = 'ignored';   Tag = '!'; Text = 'matches .gitignore' }
-    @{ Label = 'current';   Tag = ' '; Text = 'tracked, unchanged' }
+    @{ Label = 'current';   Tag = '✓'; Text = 'tracked, unchanged' }
     @{ Label = 'unmanaged'; Tag = '?'; Text = 'untracked: git does not manage it' }
     @{ Label = 'staged';    Tag = '+'; Text = 'changes staged in the index, nothing newer in the working tree' }
     @{ Label = 'changed';   Tag = 'M'; Text = 'modified in the working tree' }
@@ -198,11 +198,11 @@ Arguments:
                 A directory is listed, a file shows just its own entry (also a
                 hidden file, and a file that git has deleted, even when its
                 directory is gone too). With several paths, each directory and
-                the files of each directory come below a "Directory of" line.
+                the files of each directory come below a localized directory-header line.
                 A path must exist, otherwise the exit code is 2; the other
                 paths are still shown. Quote paths that contain spaces.
                 Wildcards are not expanded.
-  -Recurse, -r  Also list the subdirectories, each below a "Directory of" line,
+  -Recurse, -r  Also list the subdirectories, each below a localized directory-header line,
                 like DIR /S. A subdirectory that is its own git repository is
                 colored by that repository. Listed but not entered: .git and
                 directory links. Unreadable subdirectories are reported on
@@ -693,13 +693,18 @@ function Format-Entries($Entries) {
         return
     }
     $sizes = [string[]]::new($n)
+    $times = [string[]]::new($n)
     $sizeWidth = 0
+    $timeWidth = 1
     for ($i = 0; $i -lt $n; $i++) {
         $e = $Entries[$i]
         if ($e.IsDir) { $sizes[$i] = '<DIR>' }
         elseif ($null -eq $e.Size) { $sizes[$i] = '-' }
         else { $sizes[$i] = $e.Size.ToString('N0') }
         if ($sizes[$i].Length -gt $sizeWidth) { $sizeWidth = $sizes[$i].Length }
+        if ($e.OnDisk) { $times[$i] = $e.Time.ToString('g') }
+        else { $times[$i] = '-' }
+        if ($times[$i].Length -gt $timeWidth) { $timeWidth = $times[$i].Length }
     }
     for ($i = 0; $i -lt $n; $i++) {
         $e = $Entries[$i]
@@ -708,9 +713,7 @@ function Format-Entries($Entries) {
         $k = $NOSTATE
         $tag = ' '
         if ($null -ne $e.State) { $k = $e.State; $tag = $Style[$k].Tag }
-        $when = '-'.PadRight(16)
-        if ($e.OnDisk) { $when = $e.Time.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) }
-        $paintOn[$k] + $tag + $paintOff[$k] + ' ' + $when + ' ' + $sizes[$i].PadLeft($sizeWidth) + ' ' + $paintOn[$k] + $name + $paintOff[$k]
+        $paintOn[$k] + $tag + $paintOff[$k] + ' ' + $times[$i].PadRight($timeWidth) + ' ' + $sizes[$i].PadLeft($sizeWidth) + ' ' + $paintOn[$k] + $name + $paintOff[$k]
     }
 }
 
@@ -719,10 +722,67 @@ $script:failed = $false   # a path could not be shown: exit code 2 at the end
 $script:wholeTrees = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
 # directory -> what git knows below it; read for deleted files in directories that are gone
 
-# Starts a block: the "Directory of" line, after a blank line unless it is the first block.
-function Write-Header([string]$Dir) {
-    if ($script:printed -gt 0) { '' }
-    'Directory of ' + $Dir
+# Starts a block: the localized directory-header line, after a blank line unless it is the first block.
+function Get-DirectoryHeaderPrefix {
+    switch ([System.Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName) {
+        'de' { return 'Verzeichnis von' }
+        default { return 'Directory of' }
+    }
+}
+
+$directoryHeaderPrefix = Get-DirectoryHeaderPrefix
+
+function Get-GitBranchStatus([string]$Dir) {
+    try {
+        $job = Start-Git $Dir 'status --porcelain=v2 --branch --untracked-files=no'
+        $raw = Receive-Git $job
+    }
+    catch {
+        return $null
+    }
+    $branch = ''
+    $upstream = ''
+    $ahead = 0
+    $behind = 0
+    foreach ($line in $raw -split '\r?\n') {
+        if ($line.StartsWith('# branch.head ')) { $branch = $line.Substring(14) }
+        elseif ($line.StartsWith('# branch.upstream ')) { $upstream = $line.Substring(18) }
+        elseif ($line -match '^# branch\.ab \+(\d+) -(\d+)$') {
+            $ahead = [int]$matches[1]
+            $behind = [int]$matches[2]
+        }
+    }
+    if (-not $branch -or $branch -eq '(detached)') { return $null }
+    if (-not $upstream) { $status = ': no upstream' }
+    else {
+        if ($ahead -eq 0 -and $behind -eq 0) { $state = 'up to date' }
+        else {
+            $states = @()
+            if ($ahead -gt 0) { $states += "+$ahead" }
+            if ($behind -gt 0) { $states += "-$behind" }
+            $state = $states -join ' '
+        }
+        $status = " [$upstream]: $state"
+    }
+    return [pscustomobject]@{ Name = $branch; Upstream = $upstream; Status = $status }
+}
+
+function Write-Header([string]$Dir, $Branch) {
+    ''
+    if ($Branch) {
+        $branchName = $Branch.Name
+        $branchStatus = $Branch.Status
+        if ($useColor) {
+            $branchName = $esc + '[' + $Green + 'm' + $branchName + $esc + '[0m'
+            if ($Branch.Upstream) {
+                $remoteName = $esc + '[' + $Blue + 'm' + $Branch.Upstream + $esc + '[0m'
+                $branchStatus = $branchStatus.Replace($Branch.Upstream, $remoteName)
+            }
+        }
+        'Branch ' + $branchName + $branchStatus
+    }
+    $directoryHeaderPrefix + ' ' + $Dir
+    ''
     $script:printed++
 }
 
@@ -743,13 +803,13 @@ function Get-ErrorReason($ErrorRecord) {
 # Prints one directory and, with -Recurse, everything below it, depth first. $Git is what git
 # knows about the repository that contains $Dir, $Rel the path of $Dir below that repository's
 # listing root, $Inherited as for Get-Entries.
-function Write-Dir([string]$Dir, [string]$Rel, [int]$Inherited, $Git) {
+function Write-Dir([string]$Dir, [string]$Rel, [int]$Inherited, $Git, $Branch = $null) {
     try { $entries = @(Get-Entries $Dir $Rel $Inherited $Git) }
     catch {
         Write-Failure "cannot read '$Dir': $(Get-ErrorReason $_)"
         return
     }
-    if ($showHeaders) { Write-Header $Dir }
+    if ($showHeaders) { Write-Header $Dir $Branch }
     Format-Entries $entries
     if (-not $Recurse) { return }
     foreach ($e in $entries) {
@@ -779,7 +839,8 @@ function Write-Dir([string]$Dir, [string]$Rel, [int]$Inherited, $Git) {
 function Write-Files([string]$Dir, $Names) {
     $git = Read-GitState $Dir $false
     $inherited = -1
-    if ($null -ne $git) { $inherited = $git.Base }
+    $branch = $null
+    if ($null -ne $git) { $inherited = $git.Base; $branch = Get-GitBranchStatus $Dir }
     $only = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($n in $Names) { $null = $only.Add($n.Name) }
     try { $entries = @(Get-Entries $Dir '' $inherited $git $only) }
@@ -793,7 +854,7 @@ function Write-Files([string]$Dir, $Names) {
         if (-not $shown.Contains($n.Name)) { Write-Failure "cannot access '$($n.Arg)': no such file or directory" }
     }
     if ($entries.Count -eq 0) { return }
-    if ($showHeaders) { Write-Header $Dir }
+    if ($showHeaders) { Write-Header $Dir $branch }
     Format-Entries $entries
 }
 
@@ -802,6 +863,7 @@ function Write-Files([string]$Dir, $Names) {
 # that is gone, $Names as for Write-Files.
 function Write-DeletedFiles([string]$Dir, $Names) {
     $ancestor = $Dir
+    $branch = $null
     while ($ancestor -and -not [System.IO.Directory]::Exists($ancestor)) { $ancestor = [System.IO.Path]::GetDirectoryName($ancestor) }
     $kids = $null
     if ($ancestor) {
@@ -810,6 +872,7 @@ function Write-DeletedFiles([string]$Dir, $Names) {
             $git = Read-GitState $ancestor $true
             $script:wholeTrees[$ancestor] = $git
         }
+        if ($null -ne $git) { $branch = Get-GitBranchStatus $ancestor }
         if ($null -ne $git -and $git.Base -lt 0) {
             $below = $Dir.Substring($ancestor.Length).Trim('\', '/').Replace('\', '/')
             $null = $git.Ghosts.TryGetValue($below, [ref]$kids)
@@ -831,7 +894,7 @@ function Write-DeletedFiles([string]$Dir, $Names) {
     $sortKeys = $keys.ToArray()
     $entries = $recs.ToArray()
     [System.Array]::Sort($sortKeys, $entries, [System.Collections.IComparer][System.StringComparer]::OrdinalIgnoreCase)
-    if ($showHeaders) { Write-Header $Dir }
+    if ($showHeaders) { Write-Header $Dir $branch }
     Format-Entries $entries
 }
 
@@ -861,13 +924,14 @@ foreach ($arg in (@($Path) + @($Rest))) {
     $target.Names.Add(@{ Name = [System.IO.Path]::GetFileName($full); Arg = $arg })
 }
 
-$showHeaders = $Recurse -or $targets.Count -gt 1
+$showHeaders = $true
 foreach ($target in $targets) {
     if ($target.Gone) { Write-DeletedFiles $target.Dir $target.Names; continue }
     if ($null -ne $target.Names) { Write-Files $target.Dir $target.Names; continue }
     $rootGit = Read-GitState $target.Dir ([bool]$Recurse)
     $rootBase = -1
-    if ($null -ne $rootGit) { $rootBase = $rootGit.Base }
-    Write-Dir $target.Dir '' $rootBase $rootGit
+    $branch = $null
+    if ($null -ne $rootGit) { $rootBase = $rootGit.Base; $branch = Get-GitBranchStatus $target.Dir }
+    Write-Dir $target.Dir '' $rootBase $rootGit $branch
 }
 if ($script:failed) { exit 2 }
