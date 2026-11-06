@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# gupdate - Linux launcher for the PowerShell Git repository updater.
+# This file was created with the help of AI — model: GPT-6.1 Sol (model ID: gpt-6.1-sol)
+
+for dependency in pwsh git; do
+    if ! command -v "$dependency" >/dev/null 2>&1; then
+        printf 'gupdate: required dependency "%s" is missing from PATH\n' "$dependency" >&2
+        exit 2
+    fi
+done
+
+source_path=${BASH_SOURCE[0]}
+[[ $source_path == */* ]] || source_path=./$source_path
+script_dir=$(cd -- "${source_path%/*}" && pwd -P) || exit 2
+if [[ ! -r $script_dir/gupdate.ps1 ]]; then
+    printf 'gupdate: gupdate.ps1 is missing or unreadable next to the launcher\n' >&2
+    exit 2
+fi
+
+args=()
+for arg in "$@"; do
+    case $arg in
+        --install) args+=(-Install) ;;
+        *) args+=("$arg") ;;
+    esac
+done
+
+exec pwsh -NoLogo -NoProfile -File "$script_dir/gupdate.ps1" "${args[@]}"

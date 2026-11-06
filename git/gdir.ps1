@@ -11,8 +11,8 @@ Run "gdir --help" for the usage page and "gdir -Legend" for the color key.
 The colors are set in the configuration block at the top of the script.
 
 Outside a git work tree the listing is plain. Needs git on the PATH. Runs in Windows
-PowerShell 5.1 and PowerShell 7; gdir.cmd starts it from cmd.exe.
-gdir -Install copies gdir to a folder (default c:\tools) and puts that folder on the PATH.
+PowerShell 5.1 and PowerShell 7; shell wrappers support cmd.exe and Linux.
+gdir -Install copies gdir to a configurable folder and puts that folder on the PATH.
 
 .PARAMETER Path
 Files and directories to show, separated by spaces or commas. Default: the current directory.
@@ -21,7 +21,7 @@ file that git has deleted, even if its directory is gone as well. With several p
 directory and the files of every directory come below a localized directory-header line. A path must
 exist, otherwise the exit code is 2 (the other paths are still shown); quote it if it
 contains spaces. Wildcards are not expanded.
-With -Install: the folder to install into, default c:\tools.
+With -Install: the folder to install into, default c:\tools on Windows or ~/.local/bin on Linux.
 
 .PARAMETER Wide
 Short form -w. Names only, in columns like DIR /W; directories are shown in [brackets].
@@ -44,12 +44,12 @@ not set; always colors even when the output is redirected; never prints plain te
 Prints the color key and exits.
 
 .PARAMETER Install
-Copies gdir.ps1 and gdir.cmd to a folder (the Path argument, default c:\tools; created if
+Copies the script, platform launcher and shared installer to a folder (the Path argument;
+default c:\tools on Windows, ~/.local/bin on Linux; created if
 needed) and adds the folder to the PATH of the current user, unless it is already part of the
-PATH (user or machine). The user PATH is edited in the registry, so entries with %VARIABLES%
-keep working. The PATH of this session is updated too; programs that are already running keep
-their old PATH, new terminals see the new one. Files that are already up to date are left
-alone, so running -Install again updates an installation. Needs no administrator rights.
+PATH. On Windows this preserves registry PATH entries with %VARIABLES%; on Linux it appends
+a quoted PATH entry to ~/.bashrc. The session PATH is updated too; existing parent terminals
+keep their old PATH. Files already up to date are left alone. Needs no administrator rights.
 
 .PARAMETER Help
 Short form -h. Prints the usage page and exits. "--help" and "/?" do the same.
@@ -107,6 +107,12 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+$pathComparer = [StringComparer]::Ordinal
+$pathComparison = [StringComparison]::Ordinal
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    $pathComparer = [StringComparer]::OrdinalIgnoreCase
+    $pathComparison = [StringComparison]::OrdinalIgnoreCase
+}
 
 # =============================================================================================
 # Configuration: colors of the git states
@@ -158,6 +164,9 @@ $useColor = switch ($Color) {
     'always' { $true }
     'never'  { $false }
     default  { -not $env:NO_COLOR -and -not [Console]::IsOutputRedirected -and $Host.UI.SupportsVirtualTerminal }
+}
+if ($Color -eq 'always' -and (Get-Variable PSStyle -ErrorAction SilentlyContinue)) {
+    $PSStyle.OutputRendering = 'Ansi'
 }
 $esc = [char]27
 
@@ -216,9 +225,10 @@ Arguments:
                 always: color even when the output is redirected.
                 never: plain text.
   -Legend       Print the color key and exit.
-  -Install      Copy gdir.ps1 and gdir.cmd to a folder and add the folder to
+  -Install      Copy the script, platform launcher and shared installer; add the folder to
                 the user PATH, unless it is already on the PATH. The folder is
-                the path argument, default c:\tools; it is created if needed.
+                the path argument, default c:\tools on Windows or ~/.local/bin
+                on Linux; it is created if needed.
                 Needs no administrator rights. Terminals opened afterwards can
                 run gdir; running ones keep their old PATH.
   --help        Print this page and exit. Also: -Help, -h, /?
@@ -234,7 +244,7 @@ Examples:
   gdir -Wide ..\other       names only, another directory
   gdir -r                   the whole tree below the current directory
   gdir -All -Color never    include .git, no color codes
-  gdir -Install             copy gdir to c:\tools and put it on the PATH
+  gdir -Install             copy gdir to the default folder and put it on the PATH
   gdir -Install D:\bin      the same for another folder
   gdir a.txt ..\b\c.txt     show just these files, with their git state
   gdir -r src a.txt         a directory with its subdirectories, and a file
@@ -256,113 +266,18 @@ if ($unknown.Count -gt 0) { Stop-Gdir "unknown argument '$($unknown[0])'; try: g
 
 # --- install ---------------------------------------------------------------------------------
 
-# The user PATH as stored, with %VARIABLES% not expanded, so that writing it back keeps them.
-function Get-UserPath {
-    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
-    try { return [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
-    finally { $key.Dispose() }
-}
-
-# Written back with the kind it has (an expandable string, which is what Windows uses for PATH,
-# when there is no value yet), so that appending a folder changes nothing else.
-function Set-UserPath([string]$Value) {
-    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
-    try {
-        $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
-        if ($key.GetValueNames() -contains 'Path') { $kind = $key.GetValueKind('Path') }
-        $key.SetValue('Path', $Value, $kind)
-    }
-    finally { $key.Dispose() }
-}
-
-function Get-MachinePath {
-    [string][Environment]::GetEnvironmentVariable('Path', 'Machine')
-}
-
-# Tells the running programs (Explorer, and with it every terminal opened from now on) that the
-# environment changed: WM_SETTINGCHANGE to all top-level windows.
-function Send-EnvironmentChange {
-    if (-not ('Gdir.Native' -as [type])) {
-        Add-Type -Namespace Gdir -Name Native -MemberDefinition @'
-[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint flags, uint timeout, out UIntPtr result);
-'@
-    }
-    $result = [UIntPtr]::Zero
-    $null = [Gdir.Native]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
-}
-
-# A PATH entry as it is compared: %VARIABLES% expanded, quotes removed, '/' written as '\',
-# trailing separators removed.
-function ConvertTo-PathKey([string]$Entry) {
-    [Environment]::ExpandEnvironmentVariables($Entry.Trim().Trim('"')).Replace('/', '\').TrimEnd('\')
-}
-
-function Test-OnPath([string]$PathValue, [string]$Folder) {
-    $wanted = ConvertTo-PathKey $Folder
-    foreach ($entry in $PathValue.Split(';')) {
-        if ($entry.Trim() -and (ConvertTo-PathKey $entry) -eq $wanted) { return $true }    # -eq ignores case
-    }
-    return $false
-}
-
-# Copies gdir.ps1 and gdir.cmd to $Target, which is created if needed, and adds that folder to
-# the user PATH unless it is already part of the PATH.
-function Install-Gdir([string]$Target) {
-    if (-not $Target) { Stop-Gdir 'the install folder is empty' 2 }
-    if ($Target.Contains(';')) { Stop-Gdir "the install folder must not contain ';', it separates the PATH entries" 2 }
-    if ($Target.Contains('%')) { Stop-Gdir "the install folder must not contain '%'; PowerShell does not expand %VARIABLES%, use `$env:NAME" 2 }
-    $sources = @(
-        @{ From = $PSCommandPath; Name = 'gdir.ps1' }
-        @{ From = Join-Path $PSScriptRoot 'gdir.cmd'; Name = 'gdir.cmd' }
-    )
-    foreach ($source in $sources) {
-        if (-not (Test-Path -LiteralPath $source.From -PathType Leaf)) { Stop-Gdir "cannot install: $($source.Name) is missing next to the running script" 2 }
-    }
-    $folder = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Target)
-    if (-not [System.IO.Path]::IsPathRooted($folder)) { Stop-Gdir "'$Target' is not a file system folder" 2 }
-    if ($folder.Length -gt 3) { $folder = $folder.TrimEnd('\', '/') }
-    if (Test-Path -LiteralPath $folder -PathType Leaf) { Stop-Gdir "'$folder' is a file, not a folder" 2 }
-
-    if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
-        $null = New-Item -ItemType Directory -Path $folder
-        "created folder: $folder"
-    }
-    foreach ($source in $sources) {
-        $to = Join-Path $folder $source.Name
-        if ((Test-Path -LiteralPath $to -PathType Leaf) -and
-            (Get-FileHash -LiteralPath $source.From).Hash -eq (Get-FileHash -LiteralPath $to).Hash) {
-            "up to date: $to"
-        }
-        else {
-            Copy-Item -LiteralPath $source.From -Destination $to -Force
-            "copied: $to"
-        }
-    }
-
-    $userPath = Get-UserPath
-    if ((Test-OnPath $userPath $folder) -or (Test-OnPath (Get-MachinePath) $folder)) {
-        "already on the PATH: $folder"
-    }
-    else {
-        $newPath = $folder
-        if ($userPath.Trim()) { $newPath = $userPath.TrimEnd(';') + ';' + $folder }
-        Set-UserPath $newPath
-        Send-EnvironmentChange
-        "added to the user PATH: $folder"
-    }
-    if (-not (Test-OnPath $env:Path $folder)) { $env:Path = $env:Path.TrimEnd(';') + ';' + $folder }
-    'Done. Terminals opened from now on can run: gdir --help'
-}
-
 # --- run the installer ---
 if ($Install) {
     $given = @($Rest)
     if ($PSBoundParameters.ContainsKey('Path')) { $given = @($Path) + $given }
     if ($given.Count -gt 1) { Stop-Gdir "-Install takes one folder, not $($given.Count)" 2 }
-    $installFolder = 'c:\tools'
+    $installFolder = ''
     if ($given.Count -eq 1) { $installFolder = $given[0] }
-    Install-Gdir $installFolder
+    try {
+        . (Join-Path $PSScriptRoot 'git-tools-install.ps1')
+        Install-GitTool -Name gdir -SourceFolder $PSScriptRoot -Target $installFolder
+    }
+    catch { Stop-Gdir $_.Exception.Message 2 }
     return
 }
 
@@ -443,7 +358,7 @@ function Get-StateOf([char]$X, [char]$Y) {
 }
 
 # What git knows about the entries below $Dir. Paths are relative to $Dir, separated by '/',
-# and compared case-insensitively. Without $Deep only the names directly in $Dir are keys.
+# and compared using the platform's path comparer. Without $Deep only names directly in $Dir are keys.
 #   Mask       path -> bit mask (1 -shl state) of the states reported at or below it
 #   Tracked    paths in the index, and directories that contain such paths
 #   Collapsed  directory -> state, for untracked or ignored directories that git reports whole
@@ -472,7 +387,7 @@ function Read-GitState([string]$Dir, [bool]$Deep) {
 
     # '' at the repository root, else 'sub/dir/'. Status paths are relative to the root.
     $prefix = $prefixRaw.TrimEnd("`r", "`n")
-    $cmp = [System.StringComparer]::OrdinalIgnoreCase
+    $cmp = $pathComparer
 
     # After "git rm --cached" a path is reported twice (D and ??); the later record wins.
     $paths = [System.Collections.Generic.Dictionary[string, int]]::new($cmp)
@@ -483,10 +398,10 @@ function Read-GitState([string]$Dir, [bool]$Deep) {
         $state = Get-StateOf $rec[0] $rec[1]
         $p = $rec.Substring(3)
         $isDirRecord = $p.EndsWith('/', [StringComparison]::Ordinal)
-        if ($isDirRecord -and $prefix.StartsWith($p, [StringComparison]::OrdinalIgnoreCase)) {
+        if ($isDirRecord -and $prefix.StartsWith($p, $pathComparison)) {
             $base = $state    # an untracked or ignored directory that contains $Dir
         }
-        elseif ($p.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        elseif ($p.StartsWith($prefix, $pathComparison)) {
             $rel = $p.Substring($prefix.Length).TrimEnd('/')
             $paths[$rel] = $state
             if ($isDirRecord) { $collapsed[$rel] = $state }
@@ -574,7 +489,7 @@ $controlCharacters = [char[]]((0..31) + (127..159))
 function Get-Entries([string]$Dir, [string]$Rel, [int]$Inherited, $Git, $Only = $null) {
     $names = [System.Collections.Generic.List[string]]::new()
     $recs = [System.Collections.Generic.List[object]]::new()
-    $onDisk = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $onDisk = [System.Collections.Generic.HashSet[string]]::new($pathComparer)
     foreach ($fsi in ([System.IO.DirectoryInfo]$Dir).EnumerateFileSystemInfos()) {
         $name = $fsi.Name
         $null = $onDisk.Add($name)
@@ -669,6 +584,8 @@ $termWidth = 0   # 0: one name per line, because the output is not a terminal
 if ($Wide -and -not [Console]::IsOutputRedirected) {
     try { $termWidth = $Host.UI.RawUI.WindowSize.Width } catch { $termWidth = 80 }
     if ($termWidth -le 0) { $termWidth = 80 }
+    $columns = 0
+    if ([int]::TryParse($env:COLUMNS, [ref]$columns) -and $columns -gt 0) { $termWidth = $columns }
 }
 
 # The lines of one directory: names in columns with -Wide, else tag, date, size and name.
@@ -719,7 +636,7 @@ function Format-Entries($Entries) {
 
 $script:printed = 0       # blocks printed so far; a blank line goes between them
 $script:failed = $false   # a path could not be shown: exit code 2 at the end
-$script:wholeTrees = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:wholeTrees = [System.Collections.Generic.Dictionary[string, object]]::new($pathComparer)
 # directory -> what git knows below it; read for deleted files in directories that are gone
 
 # Starts a block: the localized directory-header line, after a blank line unless it is the first block.
@@ -735,7 +652,9 @@ $directoryHeaderPrefix = Get-DirectoryHeaderPrefix
 function Get-GitBranchStatus([string]$Dir) {
     try {
         $job = Start-Git $Dir 'status --porcelain=v2 --branch --untracked-files=no'
+        $rootJob = Start-Git $Dir 'rev-parse --show-toplevel'
         $raw = Receive-Git $job
+        $root = (Receive-Git $rootJob).TrimEnd("`r", "`n")
     }
     catch {
         return $null
@@ -764,12 +683,14 @@ function Get-GitBranchStatus([string]$Dir) {
         }
         $status = " [$upstream]: $state"
     }
-    return [pscustomobject]@{ Name = $branch; Upstream = $upstream; Status = $status }
+    $repository = [IO.Path]::GetFileName($root.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
+    return [pscustomobject]@{ Repository = $repository; Name = $branch; Upstream = $upstream; Status = $status }
 }
 
 function Write-Header([string]$Dir, $Branch) {
     ''
     if ($Branch) {
+        'Repository ' + $Branch.Repository
         $branchName = $Branch.Name
         $branchStatus = $Branch.Status
         if ($useColor) {
@@ -818,19 +739,23 @@ function Write-Dir([string]$Dir, [string]$Rel, [int]$Inherited, $Git, $Branch = 
         $childRel = $e.Rel
         $childInherited = $Inherited
         $childGit = $Git
+        $childBranch = $null
         $marker = [System.IO.Path]::Combine($childDir, '.git')
         if ([System.IO.Directory]::Exists($marker) -or [System.IO.File]::Exists($marker)) {
             # Another repository (submodule, nested clone): its own git state colors its files.
             $childGit = Read-GitState $childDir $true
             $childRel = ''
             $childInherited = -1
-            if ($null -ne $childGit) { $childInherited = $childGit.Base }
+            if ($null -ne $childGit) {
+                $childInherited = $childGit.Base
+                $childBranch = Get-GitBranchStatus $childDir
+            }
         }
         elseif ($Inherited -lt 0 -and $null -ne $Git) {
             $collapsedState = 0
             if ($Git.Collapsed.TryGetValue($e.Rel, [ref]$collapsedState)) { $childInherited = $collapsedState }
         }
-        Write-Dir $childDir $childRel $childInherited $childGit
+        Write-Dir $childDir $childRel $childInherited $childGit $childBranch
     }
 }
 
@@ -841,14 +766,14 @@ function Write-Files([string]$Dir, $Names) {
     $inherited = -1
     $branch = $null
     if ($null -ne $git) { $inherited = $git.Base; $branch = Get-GitBranchStatus $Dir }
-    $only = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $only = [System.Collections.Generic.HashSet[string]]::new($pathComparer)
     foreach ($n in $Names) { $null = $only.Add($n.Name) }
     try { $entries = @(Get-Entries $Dir '' $inherited $git $only) }
     catch {
         Write-Failure "cannot read '$Dir': $(Get-ErrorReason $_)"
         return
     }
-    $shown = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $shown = [System.Collections.Generic.HashSet[string]]::new($pathComparer)
     foreach ($e in $entries) { $null = $shown.Add($e.Name) }
     foreach ($n in $Names) {
         if (-not $shown.Contains($n.Name)) { Write-Failure "cannot access '$($n.Arg)': no such file or directory" }
@@ -874,7 +799,7 @@ function Write-DeletedFiles([string]$Dir, $Names) {
         }
         if ($null -ne $git) { $branch = Get-GitBranchStatus $ancestor }
         if ($null -ne $git -and $git.Base -lt 0) {
-            $below = $Dir.Substring($ancestor.Length).Trim('\', '/').Replace('\', '/')
+            $below = $Dir.Substring($ancestor.Length).Trim([IO.Path]::DirectorySeparatorChar).Replace([IO.Path]::DirectorySeparatorChar, [char]'/')
             $null = $git.Ghosts.TryGetValue($below, [ref]$kids)
         }
     }
@@ -882,7 +807,7 @@ function Write-DeletedFiles([string]$Dir, $Names) {
     $recs = [System.Collections.Generic.List[object]]::new()
     foreach ($n in $Names) {
         $spelled = $null      # the name as git spells it
-        if ($null -ne $kids) { foreach ($k in $kids.Keys) { if ($k -eq $n.Name) { $spelled = $k; break } } }
+        if ($null -ne $kids) { foreach ($k in $kids.Keys) { if ($pathComparer.Equals($k, $n.Name)) { $spelled = $k; break } } }
         if ($null -eq $spelled) { Write-Failure "cannot access '$($n.Arg)': no such file or directory"; continue }
         $keys.Add($spelled)
         $recs.Add([pscustomobject]@{
@@ -903,13 +828,13 @@ function Write-DeletedFiles([string]$Dir, $Names) {
 # Every directory argument is a block of its own. The file arguments of one directory form one
 # block, which stands where the first of them was given.
 $targets = [System.Collections.Generic.List[object]]::new()
-$fileTargets = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
-$seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$fileTargets = [System.Collections.Generic.Dictionary[string, object]]::new($pathComparer)
+$seen = [System.Collections.Generic.HashSet[string]]::new($pathComparer)
 foreach ($arg in (@($Path) + @($Rest))) {
     if (-not $arg) { Write-Failure "cannot access '': no such file or directory"; continue }
     $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($arg)
     if (-not [System.IO.Path]::IsPathRooted($full)) { Write-Failure "cannot access '$arg': not a file system path"; continue }
-    if ($full.Length -gt 3) { $full = $full.TrimEnd('\', '/') }
+    if ($full.Length -gt [IO.Path]::GetPathRoot($full).Length) { $full = $full.TrimEnd([IO.Path]::DirectorySeparatorChar) }
     if (-not $seen.Add($full)) { continue }
     if ([System.IO.Directory]::Exists($full)) { $targets.Add(@{ Dir = $full; Names = $null; Gone = $false }); continue }
     $parent = [System.IO.Path]::GetDirectoryName($full)

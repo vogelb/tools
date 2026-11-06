@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# gdir - Linux launcher for the PowerShell Git-aware directory listing.
+# This file was created with the help of AI — model: GPT-6.1 Sol (model ID: gpt-6.1-sol)
+
+for dependency in pwsh git; do
+    if ! command -v "$dependency" >/dev/null 2>&1; then
+        printf 'gdir: required dependency "%s" is missing from PATH\n' "$dependency" >&2
+        exit 2
+    fi
+done
+
+source_path=${BASH_SOURCE[0]}
+[[ $source_path == */* ]] || source_path=./$source_path
+script_dir=$(cd -- "${source_path%/*}" && pwd -P) || exit 2
+if [[ ! -r $script_dir/gdir.ps1 ]]; then
+    printf 'gdir: gdir.ps1 is missing or unreadable next to the launcher\n' >&2
+    exit 2
+fi
+
+args=()
+for arg in "$@"; do
+    [[ $arg != -- ]] || break
+    if [[ $arg == --help || $arg == -h || $arg == '-?' ]]; then
+        exec pwsh -NoLogo -NoProfile -File "$script_dir/gdir.ps1" -Help
+    fi
+done
+while (($#)); do
+    case $1 in
+        --install) args+=(-Install) ;;
+        --legend) args+=(-Legend) ;;
+        --recurse) args+=(-Recurse) ;;
+        --wide) args+=(-Wide) ;;
+        --all) args+=(-All) ;;
+        --color=*) args+=(-Color "${1#*=}") ;;
+        --color)
+            args+=(-Color)
+            case ${2-} in
+                auto|always|never) args+=("$2"); shift ;;
+                *) args+=(always) ;;
+            esac ;;
+        -[rawh]*)
+            flags=${1#-}
+            while [[ -n $flags ]]; do
+                case ${flags:0:1} in
+                    r) args+=(-Recurse) ;;
+                    a) args+=(-All) ;;
+                    w) args+=(-Wide) ;;
+                    h) exec pwsh -NoLogo -NoProfile -File "$script_dir/gdir.ps1" -Help ;;
+                    *) printf 'gdir: unknown option "%s"\n' "$1" >&2; exit 2 ;;
+                esac
+                flags=${flags:1}
+            done ;;
+        --)
+            shift
+            for path in "$@"; do
+                [[ $path != -* ]] || path=./$path
+                args+=("$path")
+            done
+            break ;;
+        -) args+=(./-) ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+
+exec pwsh -NoLogo -NoProfile -File "$script_dir/gdir.ps1" "${args[@]}"
