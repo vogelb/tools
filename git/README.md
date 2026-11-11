@@ -6,7 +6,7 @@ This document was created with the help of AI — model: GPT-6.1 Sol (model ID: 
 This folder contains `gdir` for Git-aware directory listings and `gupdate` for updating repositories.
 
 ## gupdate - Update Git repositories with fast-forward-only pulls
-Run `gupdate` with repository paths to update those repositories using `git pull --ff-only`. If a path is a folder without its own `.git` directory or file, its immediate child repositories are updated instead. With no paths, it updates the immediate child repositories in the current working directory. It does not recurse further.
+Run `gupdate` with repository paths to update those repositories using `git pull --ff-only`. If a path is a folder without its own `.git` directory or file, its immediate child repositories are updated instead. With no paths, it updates the current repository when run inside its worktree; otherwise, it updates the immediate child repositories in the current working directory. It does not recurse further.
 
 From the repository root in PowerShell:
 
@@ -41,7 +41,7 @@ From `cmd.exe`: `gupdate.cmd -Install [folder]`. The installer copies `gupdate.p
 
 Like `gdir -Install`, it adds the folder to the user `PATH` unless already present in the user or machine `PATH`, preserves existing `%VARIABLES%` and the registry value kind, notifies Windows of the change, and updates the current PowerShell session's `PATH`. No administrator rights are needed. A child process launched by the cmd wrapper cannot change its parent terminal's `PATH`; open a new terminal after installation from cmd.exe.
 
-Keep the shared installer next to the scripts to use `-Install`. On Windows the install folder must not contain `;` or `%`. PowerShell must allow local scripts. For configurable Linux installation, see [Linux launchers](#linux-launchers). To update repositories, change to their parent directory and run `gupdate`.
+Keep the shared installer next to the scripts to use `-Install`. On Windows the install folder must not contain `;` or `%`. PowerShell must allow local scripts. For configurable Linux installation, see [Linux launchers](#linux-launchers). To update multiple repositories, change to their parent directory outside a worktree and run `gupdate`, or supply their paths.
 
 ### Tests
 From the repository root:

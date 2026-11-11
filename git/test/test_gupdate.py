@@ -43,7 +43,9 @@ class GupdateTests(unittest.TestCase):
             "GIT_COMMITTER_NAME": "Test",
             "GIT_COMMITTER_EMAIL": "test@example.invalid",
             "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CEILING_DIRECTORIES": str(self.root),
             "HOME": str(home),
+            "PATH": str(pathlib.Path(GIT).parent) + os.pathsep + os.environ["PATH"],
         })
         if os.name == "nt":
             self.env["PSModulePath"] = str(pathlib.Path(os.environ["SystemRoot"]) /
@@ -76,6 +78,45 @@ class GupdateTests(unittest.TestCase):
         self.git("-C", seed, "commit", "--quiet", "--allow-empty", "-m", "update")
         self.git("-C", seed, "push", "--quiet")
         return self.git("-C", seed, "rev-parse", "HEAD")
+
+    def test_no_paths_updates_containing_worktree_instead_of_child_repositories(self):
+        remote, seed = self.make_remote()
+        clone = self.repos / "repo with spaces"
+        self.git("clone", "--quiet", "--separate-git-dir", self.root / "metadata", remote, clone)
+        subdir = clone / "subdir"
+        subdir.mkdir()
+        child = subdir / "child"
+        self.git("clone", "--quiet", remote, child)
+        original = self.git("-C", child, "rev-parse", "HEAD")
+        for shell in SHELLS:
+            for cwd in (clone, subdir):
+                with self.subTest(shell=shell, cwd=cwd):
+                    expected = self.advance(seed)
+                    result = self.run_ps(shell, "-File", str(TOOLS / "gupdate.ps1"), cwd=cwd)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(f'Updating "{clone.name}"', result.stdout)
+                    self.assertEqual(self.git("-C", clone, "rev-parse", "HEAD"), expected)
+                    self.assertEqual(self.git("-C", child, "rev-parse", "HEAD"), original)
+
+    def test_force_without_paths_updates_containing_worktree(self):
+        remote, seed = self.make_remote()
+        tracked = seed / "tracked.txt"
+        tracked.write_text("initial\n", encoding="ascii")
+        self.git("-C", seed, "add", "tracked.txt")
+        self.git("-C", seed, "commit", "--quiet", "-m", "tracked")
+        self.git("-C", seed, "push", "--quiet")
+        clone = self.repos / "repo"
+        self.git("clone", "--quiet", remote, clone)
+        subdir = clone / "subdir"
+        subdir.mkdir()
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                (clone / "tracked.txt").write_text("local\n", encoding="ascii")
+                result = self.run_ps(shell, "-File", str(TOOLS / "gupdate.ps1"),
+                                     "--force", cwd=subdir)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("discard", result.stdout)
+                self.assertEqual((clone / "tracked.txt").read_text(encoding="ascii"), "initial\n")
 
     def test_pulls_continue_after_failure_and_support_git_files(self):
         remote, seed = self.make_remote()

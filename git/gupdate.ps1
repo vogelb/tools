@@ -3,7 +3,7 @@
 Updates selected Git repositories using fast-forward-only pulls.
 .DESCRIPTION
 Runs git pull --ff-only in supplied repositories or immediate child repositories of supplied folders.
-With no paths, updates
+With no paths, updates the current repository when inside a worktree; otherwise updates
 each immediate child directory with a .git file or directory in the current working directory.
 Continues after failures. Does not recurse, switch branches, stash changes or create merges.
 Runs in Windows PowerShell 5.1 and PowerShell 7. Shell wrappers support cmd.exe and Linux.
@@ -60,8 +60,9 @@ Usage:
   gupdate --help
 
 Paths may be relative or absolute. A repository is updated directly; any other
-folder updates its immediate child repositories. With no paths, updates all immediate
-child repositories in the current working directory. Does not recurse.
+folder updates its immediate child repositories. With no paths, updates the current
+repository if inside a worktree; otherwise updates immediate child repositories.
+Does not recurse.
 Explicit paths must be directories; all are validated before updating.
 Requires Git on PATH. Continues after failed pulls.
 --force (or -Force) warns, then runs git reset --hard HEAD before each pull.
@@ -103,9 +104,19 @@ if (-not $git) { Stop-Gupdate 'Git is not available on PATH.' 1 }
 $ErrorActionPreference = 'Continue'
 $failed = $false
 $found = $false
+$currentRepository = $false
 try {
     if ($arguments.Count -eq 0) {
-        $directories = @(Get-ChildItem -LiteralPath . -Directory -ErrorAction Stop)
+        $insideWorktree = & $git.Source rev-parse --is-inside-work-tree 2>$null
+        if ($LASTEXITCODE -eq 0 -and $insideWorktree -eq 'true') {
+            $repositoryRoot = & $git.Source rev-parse --show-toplevel
+            if ($LASTEXITCODE -ne 0) { throw 'Could not determine the current repository root.' }
+            $currentRepository = $true
+            $directories = @(Get-Item -LiteralPath $repositoryRoot -ErrorAction Stop)
+        }
+        else {
+            $directories = @(Get-ChildItem -LiteralPath . -Directory -ErrorAction Stop)
+        }
     }
     else {
         $directories = @(foreach ($repository in $arguments) {
@@ -131,7 +142,7 @@ try {
     $seen = [Collections.Generic.HashSet[string]]::new($comparer)
     foreach ($directory in $directories) {
         if (-not $seen.Add($directory.FullName)) { continue }
-        if (Test-Path -LiteralPath (Join-Path $directory.FullName '.git') -ErrorAction Stop) {
+        if ($currentRepository -or (Test-Path -LiteralPath (Join-Path $directory.FullName '.git') -ErrorAction Stop)) {
             $found = $true
             Write-Output ''
             Write-Output "Updating `"$($directory.Name)`"..."
