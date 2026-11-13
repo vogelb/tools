@@ -4,3 +4,4 @@
 # Linux launchers need LF line endings.
 /gdir text eol=lf
 /gupdate text eol=lf
+/gitignore text eol=lf

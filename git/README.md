@@ -3,7 +3,20 @@
 ## AI disclaimer
 This document was created with the help of AI — model: GPT-6.1 Sol (model ID: gpt-6.1-sol)
 
-This folder contains `gdir` for Git-aware directory listings and `gupdate` for updating repositories.
+This folder contains `gdir` for Git-aware directory listings, `gupdate` for updating repositories, and `gitignore` for managing ignore patterns.
+
+## gitignore - Add ignore patterns and untrack matching files
+
+`gitignore` adds one or more patterns to the repository-root `.gitignore`, skips entries already present, and lists effectively ignored files covered by the requested patterns. Matching tracked files are removed from the index after a warning; working files are preserved.
+
+```powershell
+gitignore "subfolder\Hello" "logs\*.log"
+gitignore "logs\*.log" -IgnoreFile .\src\.gitignore
+```
+
+Backslashes in both paths and wildcard patterns are converted to forward slashes before duplicate checks, storage, and matching. Backslashes are therefore treated as path separators, not Git pattern escapes. Patterns remain relative to the selected `.gitignore`, not the current directory. Quote wildcards to prevent shell expansion. Use `/` to anchor literal names starting with `#`, `!`, or `-`.
+
+Run `gitignore.ps1` in PowerShell, `gitignore.cmd` from cmd.exe, or the Linux `gitignore` launcher. Use `-Install [folder]` for the shared installer and `--help` for usage.
 
 ## gupdate - Update Git repositories with fast-forward-only pulls
 Run `gupdate` with repository paths to update those repositories using `git pull --ff-only`. If a path is a folder without its own `.git` directory or file, its immediate child repositories are updated instead. With no paths, it updates the current repository when run inside its worktree; otherwise, it updates the immediate child repositories in the current working directory. It does not recurse further.
